@@ -5,6 +5,9 @@ on:
   schedule:
     - cron: "*/15 * * * *"
 
+permissions:
+  contents: read
+
 jobs:
   macd:
     runs-on: ubuntu-latest
@@ -15,7 +18,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: CoinGecko 4H MACD TEST
+      - name: Top 100 - 4H MACD
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -24,85 +27,180 @@ jobs:
           pip install requests pandas
 
           python - <<'PY'
+          import os
+          import time
           import requests
           import pandas as pd
 
-          # BTC test
-          url = "https://api.coingecko.com/api/v3/coins/bitcoin/ohlc"
+          BASE = "https://api.bybit.com"
 
-          params = {
-              "vs_currency": "usd",
-              "days": "30"
-          }
+          TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+          CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-          r = requests.get(
-              url,
-              params=params,
-              timeout=30
+          session = requests.Session()
+          session.headers.update({
+              "User-Agent": "Mozilla/5.0"
+          })
+
+          def bybit_get(endpoint, params):
+
+              r = session.get(
+                  BASE + endpoint,
+                  params=params,
+                  timeout=20
+              )
+
+              print(
+                  f"{endpoint} -> {r.status_code}"
+              )
+
+              r.raise_for_status()
+
+              data = r.json()
+
+              if data.get("retCode") != 0:
+                  raise RuntimeError(
+                      f"Bybit: {data}"
+                  )
+
+              return data["result"]
+
+          def telegram(message):
+
+              url = (
+                  f"https://api.telegram.org/"
+                  f"bot{TOKEN}/sendMessage"
+              )
+
+              r = session.post(
+                  url,
+                  data={
+                      "chat_id": CHAT_ID,
+                      "text": message
+                  },
+                  timeout=20
+              )
+
+              print(
+                  "Telegram:",
+                  r.status_code
+              )
+
+          # ==========================================
+          # TOP 100 USDT
+          # ==========================================
+
+          result = bybit_get(
+              "/v5/market/tickers",
+              {
+                  "category": "linear"
+              }
           )
 
-          print("HTTP:", r.status_code)
-          print("URL:", r.url)
-          print("Cevap:", r.text[:500])
+          tickers = result["list"]
 
-          r.raise_for_status()
+          coins = []
 
-          data = r.json()
+          for item in tickers:
 
-          if not isinstance(data, list):
-              raise RuntimeError(
-                  f"Beklenmeyen cevap: {data}"
+              symbol = item.get("symbol", "")
+
+              # Sadece USDT perpetual
+              if not symbol.endswith("USDT"):
+                  continue
+
+              try:
+                  turnover = float(
+                      item["turnover24h"]
+                  )
+              except:
+                  continue
+
+              coins.append(
+                  (symbol, turnover)
               )
 
-          print("Toplam mum:", len(data))
+          # 24 saatlik işlem hacmine göre sırala
+          coins.sort(
+              key=lambda x: x[1],
+              reverse=True
+          )
 
-          closes = pd.Series([
-              float(x[4])
-              for x in data
-          ])
+          symbols = [
+              x[0]
+              for x in coins[:100]
+          ]
 
-          if len(closes) < 35:
-              raise RuntimeError(
-                  "MACD için yeterli mum yok."
-              )
+          print(
+              f"TOP 100 bulundu: {len(symbols)}"
+          )
 
-          ema12 = closes.ewm(
-              span=12,
-              adjust=False
-          ).mean()
+          # ==========================================
+          # 4H MACD 12 / 26 / 9
+          # ==========================================
 
-          ema26 = closes.ewm(
-              span=26,
-              adjust=False
-          ).mean()
+          for symbol in symbols:
 
-          macd = ema12 - ema26
+              try:
 
-          signal = macd.ewm(
-              span=9,
-              adjust=False
-          ).mean()
+                  result = bybit_get(
+                      "/v5/market/kline",
+                      {
+                          "category": "linear",
+                          "symbol": symbol,
+                          "interval": "240",
+                          "limit": "100"
+                      }
+                  )
 
-          histogram = macd - signal
+                  rows = result["list"]
 
-          previous = histogram.iloc[-2]
-          current = histogram.iloc[-1]
+                  if len(rows) < 40:
+                      continue
 
-          print("--------------------------------")
-          print("BTC TEST")
-          print("Önceki histogram:", previous)
-          print("Son histogram:", current)
+                  # Bybit en yeni mumu ilk sırada döndürür.
+                  rows = sorted(
+                      rows,
+                      key=lambda x: int(x[0])
+                  )
 
-          if previous < 0 and current >= 0:
-              print("🟢 AL SİNYALİ")
+                  # Son mum açık olabilir.
+                  # Onu tamamen çıkarıyoruz.
+                  closed = rows[:-1]
 
-          elif previous >= 0 and current < 0:
-              print("🔴 SAT SİNYALİ")
+                  closes = pd.Series([
+                      float(row[4])
+                      for row in closed
+                  ])
 
-          else:
-              print("Sinyal yok.")
+                  if len(closes) < 35:
+                      continue
 
-          print("--------------------------------")
-          print("✅ CoinGecko 4H MACD TEST BAŞARILI")
+                  # MACD 12 / 26
+                  ema12 = closes.ewm(
+                      span=12,
+                      adjust=False
+                  ).mean()
 
-          PY
+                  ema26 = closes.ewm(
+                      span=26,
+                      adjust=False
+                  ).mean()
+
+                  macd = ema12 - ema26
+
+                  # Signal 9
+                  signal = macd.ewm(
+                      span=9,
+                      adjust=False
+                  ).mean()
+
+                  # Histogram
+                  hist = macd - signal
+
+                  # Son 3 KAPANMIŞ mum
+                  h1 = hist.iloc[-3]
+                  h2 = hist.iloc[-2]
+                  h3 = hist.iloc[-1]
+
+                  price = closes
