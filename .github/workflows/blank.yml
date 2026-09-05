@@ -10,47 +10,46 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Python kurulumu
+      - name: Python kur
         uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
-      - name: TradingView Top 100 - 4H MACD
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-
+      - name: Gerekli paketleri kur
         run: |
           pip install requests pandas
 
-          python - <<'PY'
-          import os
+      - name: MACD tara ve Telegram gönder
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python <<'PY'
           import requests
           import pandas as pd
+          import time
+          import re
 
           TV_URL = "https://scanner.tradingview.com/crypto/scan"
 
-          TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-          CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+          HEADERS = {
+              "User-Agent": "Mozilla/5.0",
+              "Content-Type": "application/json",
+              "Origin": "https://www.tradingview.com",
+              "Referer": "https://www.tradingview.com/"
+          }
 
-          # TradingView'dan büyük CEX USDT çiftlerini al
-          exchanges = [
-              "BINANCE",
-              "BYBIT",
-              "OKX",
-              "BITGET",
-              "COINBASE"
-          ]
-
-          symbols = []
-
-          # ==========================================
-          # TOP 100 KRİPTO
-          # Hacme göre TradingView'dan
-          # ==========================================
+          # ============================================================
+          # 1) GERÇEK MARKET CAP TOP 200
+          # ============================================================
 
           payload = {
               "filter": [
+                  {
+                      "left": "market_cap_basic",
+                      "operation": "greater",
+                      "right": 0
+                  },
                   {
                       "left": "name",
                       "operation": "match",
@@ -71,252 +70,331 @@ jobs:
               },
               "columns": [
                   "name",
-                  "close",
-                  "volume",
-                  "change"
+                  "ticker",
+                  "market_cap_basic",
+                  "exchange",
+                  "close"
               ],
               "sort": {
-                  "sortBy": "volume",
+                  "sortBy": "market_cap_basic",
                   "sortOrder": "desc"
               },
               "range": [
                   0,
-                  300
+                  500
               ]
           }
 
           r = requests.post(
               TV_URL,
+              headers=HEADERS,
               json=payload,
               timeout=30
           )
 
-          print("TradingView:", r.status_code)
-
           r.raise_for_status()
 
-          data = r.json()
+          data = r.json().get("data", [])
 
-          rows = data.get("data", [])
+          if not data:
+              raise Exception("TradingView Top 200 verisi alınamadı.")
 
-          print(
-              "TradingView sonuç:",
-              len(rows)
-          )
+          # ============================================================
+          # 2) SADECE GERÇEK USDT SPOT PARİTELERİ
+          # ============================================================
 
-          # Sadece gerçek USDT çiftleri
-          for row in rows:
+          # Büyük CEX'ler.
+          # Böylece DEX / kaldıraçlı / garip token pariteleri
+          # mümkün olduğunca dışarıda tutulur.
+          allowed_exchanges = {
+              "BINANCE",
+              "BYBIT",
+              "OKX",
+              "COINBASE",
+              "KRAKEN",
+              "KUCOIN",
+              "GATEIO",
+              "BITGET",
+              "MEXC",
+              "BITFINEX",
+              "CRYPTOCOM"
+          }
 
-              ticker = row.get("s", "")
+          coins = []
+
+          for item in data:
+              symbol = item.get("s", "")
+              values = item.get("d", [])
+
+              if len(values) < 5:
+                  continue
+
+              name = values[0]
+              ticker = values[1]
+              market_cap = values[2]
+              exchange = values[3]
 
               if not ticker:
                   continue
 
-              if not ticker.endswith("USDT"):
+              if not str(ticker).upper().endswith("USDT"):
                   continue
 
-              # Aynı coin'in farklı borsalardaki
-              # tekrarlarını engelle
-              base = ticker.split(":")[-1]
+              if exchange and str(exchange).upper() not in allowed_exchanges:
+                  continue
 
-              if base not in [
-                  x.split(":")[-1]
-                  for x in symbols
-              ]:
-                  symbols.append(ticker)
+              if market_cap is None:
+                  continue
 
-              if len(symbols) >= 100:
-                  break
+              # Kaldıraçlı tokenleri ele
+              upper_name = str(name).upper()
 
-          print(
-              f"TOP 100 bulundu: {len(symbols)}"
+              bad_words = [
+                  "3L", "3S",
+                  "5L", "5S",
+                  "UP", "DOWN",
+                  "BULL", "BEAR",
+                  "LONG", "SHORT"
+              ]
+
+              if any(
+                  upper_name.endswith(x) or
+                  upper_name.endswith(x + "USDT")
+                  for x in bad_words
+              ):
+                  continue
+
+              coins.append({
+                  "ticker": ticker,
+                  "name": name,
+                  "market_cap": float(market_cap),
+                  "exchange": exchange
+              })
+
+          # Market cap'e göre tekrar sırala
+          coins.sort(
+              key=lambda x: x["market_cap"],
+              reverse=True
           )
 
-          # ==========================================
-          # MACD
-          # ==========================================
+          # Aynı coin birden fazla borsadaysa yalnızca ilkini al.
+          # Böylece 200 coin hedefliyoruz, 200 parite değil.
+          selected = []
+          seen_bases = set()
 
-          # TradingView scanner'dan doğrudan
-          # 4H MACD değerlerini alacağız.
-          #
-          # MACD.macd|240
-          # MACD.signal|240
-          #
-          # Histogram = MACD - Signal
-          #
-          # Önceki ve mevcut kapanmış mum için
-          # değerleri alıyoruz.
+          for coin in coins:
 
-          selected = symbols[:100]
+              ticker = str(coin["ticker"])
 
-          # TradingView tek istekte çok sayıda sembol
-          # kabul ediyor.
-          payload = {
+              # Örn:
+              # BINANCE:BTCUSDT
+              # BTCUSDT
+              base = ticker.split(":")[-1]
+
+              if base.endswith("USDT"):
+                  base = base[:-4]
+
+              if base in seen_bases:
+                  continue
+
+              seen_bases.add(base)
+              selected.append(coin)
+
+              if len(selected) >= 200:
+                  break
+
+          print("========================================")
+          print("MARKET CAP TOP 200")
+          print("Bulunan coin sayısı:", len(selected))
+          print("========================================")
+
+          for i, coin in enumerate(selected[:20], 1):
+              print(
+                  i,
+                  coin["name"],
+                  coin["ticker"],
+                  f"MCAP={coin['market_cap']:,.0f}"
+              )
+
+          if not selected:
+              raise Exception("Market Cap Top 200 listesi boş.")
+
+          # ============================================================
+          # 3) TOP 200 İÇİN 4H MACD VERİSİNİ ÇEK
+          # ============================================================
+
+          tickers = [x["ticker"] for x in selected]
+
+          macd_payload = {
+              "filter": [
+                  {
+                      "left": "name",
+                      "operation": "match",
+                      "right": ".*USDT$"
+                  }
+              ],
+              "options": {
+                  "lang": "en"
+              },
+              "markets": [
+                  "crypto"
+              ],
               "symbols": {
-                  "tickers": selected,
                   "query": {
                       "types": []
-                  }
+                  },
+                  "tickers": tickers
               },
               "columns": [
                   "name",
                   "close",
+
                   "MACD.macd|240",
                   "MACD.signal|240",
+
                   "MACD.macd[1]|240",
-                  "MACD.signal[1]|240"
+                  "MACD.signal[1]|240",
+
+                  "MACD.macd[2]|240",
+                  "MACD.signal[2]|240"
+              ],
+              "range": [
+                  0,
+                  500
               ]
           }
 
-          r = requests.post(
+          r2 = requests.post(
               TV_URL,
-              json=payload,
+              headers=HEADERS,
+              json=macd_payload,
               timeout=30
           )
 
-          print(
-              "MACD TradingView:",
-              r.status_code
-          )
+          r2.raise_for_status()
 
-          r.raise_for_status()
+          macd_data = r2.json().get("data", [])
 
-          result = r.json()
+          # ============================================================
+          # 4) MACD HISTOGRAM RENK / YÖN DEĞİŞİMİ
+          # ============================================================
 
-          macd_rows = result.get(
-              "data",
-              []
-          )
+          signals = []
 
-          print(
-              "MACD sonucu:",
-              len(macd_rows)
-          )
+          for item in macd_data:
 
-          # ==========================================
-          # AL / SAT
-          # ==========================================
+              symbol = item.get("s", "")
+              values = item.get("d", [])
 
-          for row in macd_rows:
+              if len(values) < 8:
+                  continue
 
-              try:
+              name = values[0]
+              price = values[1]
 
-                  symbol = row["s"]
+              macd0 = values[2]
+              signal0 = values[3]
 
-                  values = row["d"]
+              macd1 = values[4]
+              signal1 = values[5]
 
-                  # Alan sırası:
-                  # name
-                  # close
-                  # MACD current
-                  # signal current
-                  # MACD previous
-                  # signal previous
+              macd2 = values[6]
+              signal2 = values[7]
 
-                  price = values[1]
+              numbers = [
+                  macd0, signal0,
+                  macd1, signal1,
+                  macd2, signal2
+              ]
 
-                  macd_current = values[2]
-                  signal_current = values[3]
+              if any(x is None for x in numbers):
+                  continue
 
-                  macd_previous = values[4]
-                  signal_previous = values[5]
+              # Histogram
+              h1 = macd0 - signal0
+              h2 = macd1 - signal1
+              h3 = macd2 - signal2
 
-                  if any(
-                      x is None
-                      for x in [
-                          macd_current,
-                          signal_current,
-                          macd_previous,
-                          signal_previous
-                      ]
-                  ):
-                      continue
+              # Son KAPANMIŞ 4H mumdaki histogram eğimi
+              current_slope = h1 - h2
 
-                  # Histogram
-                  current_hist = (
-                      macd_current -
-                      signal_current
-                  )
+              # Ondan önceki kapanmış mumdaki histogram eğimi
+              previous_slope = h2 - h3
 
-                  previous_hist = (
-                      macd_previous -
-                      signal_previous
-                  )
+              signal = None
 
-                  # =================================
-                  # 🔴 -> 🟢
-                  # =================================
+              # 🔴 Düşüyordu -> 🟢 yükselmeye başladı
+              if previous_slope <= 0 and current_slope > 0:
+                  signal = "AL 🟢"
 
-                  if (
-                      previous_hist <= 0
-                      and current_hist > 0
-                  ):
+              # 🟢 Yükseliyordu -> 🔴 düşmeye başladı
+              elif previous_slope >= 0 and current_slope < 0:
+                  signal = "SAT 🔴"
 
-                      message = (
-                          "🚨 MACD 4H ALARM 🚨\n\n"
-                          f"Coin: {symbol}\n"
-                          "Timeframe: 4H\n"
-                          "Sinyal: AL 🟢\n"
-                          f"Fiyat: {price}\n\n"
-                          f"Histogram: "
-                          f"{previous_hist:.8f} → "
-                          f"{current_hist:.8f}"
-                      )
+              if signal:
+                  signals.append({
+                      "symbol": symbol,
+                      "name": name,
+                      "price": price,
+                      "signal": signal,
+                      "histogram": h1
+                  })
 
-                      print(message)
+          # ============================================================
+          # 5) TELEGRAM
+          # ============================================================
 
-                      requests.post(
-                          f"https://api.telegram.org/"
-                          f"bot{TOKEN}/sendMessage",
-                          data={
-                              "chat_id": CHAT_ID,
-                              "text": message
-                          },
-                          timeout=20
-                      )
+          token = "${TELEGRAM_BOT_TOKEN}"
+          chat_id = "${TELEGRAM_CHAT_ID}"
 
-                  # =================================
-                  # 🟢 -> 🔴
-                  # =================================
+          # GitHub env değerlerini Python'a güvenli şekilde al
+          import os
 
-                  elif (
-                      previous_hist >= 0
-                      and current_hist < 0
-                  ):
+          token = os.environ.get("TELEGRAM_BOT_TOKEN")
+          chat_id = os.environ.get("TELEGRAM_CHAT_ID")
 
-                      message = (
-                          "🚨 MACD 4H ALARM 🚨\n\n"
-                          f"Coin: {symbol}\n"
-                          "Timeframe: 4H\n"
-                          "Sinyal: SAT 🔴\n"
-                          f"Fiyat: {price}\n\n"
-                          f"Histogram: "
-                          f"{previous_hist:.8f} → "
-                          f"{current_hist:.8f}"
-                      )
+          if not token or not chat_id:
+              raise Exception(
+                  "TELEGRAM_BOT_TOKEN veya TELEGRAM_CHAT_ID bulunamadı."
+              )
 
-                      print(message)
+          if not signals:
+              print("Bu taramada yeni MACD sinyali yok.")
+              exit(0)
 
-                      requests.post(
-                          f"https://api.telegram.org/"
-                          f"bot{TOKEN}/sendMessage",
-                          data={
-                              "chat_id": CHAT_ID,
-                              "text": message
-                          },
-                          timeout=20
-                      )
+          for s in signals:
 
-              except Exception as e:
+              symbol = s["symbol"].split(":")[-1]
 
-                  print(
-                      "Coin hata:",
-                      type(e).__name__,
-                      e
-                  )
+              message = (
+                  "🚨 MACD 4H ALARM 🚨\n\n"
+                  f"Coin: {symbol}\n"
+                  "Timeframe: 4H\n"
+                  f"Sinyal: {s['signal']}\n"
+                  f"Fiyat: {s['price']}\n"
+                  f"Histogram: {s['histogram']:.8f}\n\n"
+                  "📊 Market Cap Top 200"
+              )
 
-          print(
-              "✅ TOP 100 4H MACD TARAMASI TAMAMLANDI"
-          )
+              url = (
+                  f"https://api.telegram.org/bot{token}/sendMessage"
+              )
 
+              response = requests.post(
+                  url,
+                  data={
+                      "chat_id": chat_id,
+                      "text": message
+                  },
+                  timeout=20
+              )
+
+              response.raise_for_status()
+
+              print("Telegram gönderildi:", symbol)
+
+          print("========================================")
+          print("Tarama tamamlandı.")
+          print("Sinyal sayısı:", len(signals))
+          print("========================================")
           PY
