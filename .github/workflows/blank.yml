@@ -1,9 +1,9 @@
 name: MACD Alarm
 
 on:
+  workflow_dispatch:
   schedule:
     - cron: "*/15 * * * *"
-  workflow_dispatch:
 
 jobs:
   macd:
@@ -18,8 +18,9 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
         run: |
-          pip install requests pandas
+          python -m pip install --user requests pandas
 
           python - <<'PY'
           import os
@@ -29,7 +30,6 @@ jobs:
           SYMBOL = "BTCUSDT"
           INTERVAL = "${{ matrix.interval }}"
 
-          # Binance ana API yerine public market-data endpoint
           url = "https://data-api.binance.vision/api/v3/klines"
 
           response = requests.get(
@@ -42,7 +42,7 @@ jobs:
               timeout=20
           )
 
-          print("HTTP:", response.status_code)
+          print("Binance HTTP:", response.status_code)
 
           if response.status_code != 200:
               print(response.text)
@@ -58,7 +58,7 @@ jobs:
 
           df["close"] = pd.to_numeric(df[4])
 
-          # Açık mumu kullanma
+          # Henüz kapanmamış mumu kullanma
           df = df.iloc[:-1].copy()
 
           # MACD
@@ -74,7 +74,7 @@ jobs:
 
           macd = ema12 - ema26
 
-          # Signal = MACD'nin 9 EMA'sı
+          # Signal çizgisi
           signal = macd.ewm(
               span=9,
               adjust=False
@@ -86,19 +86,23 @@ jobs:
           previous_signal = signal.iloc[-2]
           current_signal = signal.iloc[-1]
 
-          print("Timeframe:", INTERVAL)
+          print()
+          print("================================")
+          print("COIN:", SYMBOL)
+          print("TIMEFRAME:", INTERVAL)
+          print("================================")
           print("Previous MACD:", previous_macd)
           print("Current MACD:", current_macd)
           print("Previous Signal:", previous_signal)
           print("Current Signal:", current_signal)
 
-          # MACD signal'i yukarı keserse AL
+          # MACD Signal'i yukarı keserse AL
           buy = (
               previous_macd <= previous_signal
               and current_macd > current_signal
           )
 
-          # MACD signal'i aşağı keserse SAT
+          # MACD Signal'i aşağı keserse SAT
           sell = (
               previous_macd >= previous_signal
               and current_macd < current_signal
@@ -118,7 +122,7 @@ jobs:
               price = float(df["close"].iloc[-1])
 
               message = (
-                  f"MACD ALARM\n\n"
+                  "MACD ALARM\n\n"
                   f"Coin: {SYMBOL}\n"
                   f"Timeframe: {INTERVAL}\n"
                   f"Sinyal: {action}\n"
@@ -127,30 +131,45 @@ jobs:
                   f"Signal: {current_signal:.6f}"
               )
 
-              telegram_url = (
-                  "https://api.telegram.org/bot"
-                  f"{os.environ['TELEGRAM_BOT_TOKEN']}/sendMessage"
-              )
+              token = os.environ.get("TELEGRAM_BOT_TOKEN")
+              chat_id = os.environ.get("TELEGRAM_CHAT_ID")
 
-              telegram_response = requests.post(
-                  telegram_url,
-                  data={
-                      "chat_id": os.environ["TELEGRAM_CHAT_ID"],
-                      "text": message
-                  },
-                  timeout=20
-              )
+              if not token or not chat_id:
+                  print("Telegram secret bulunamadı.")
+                  print("Sadece MACD sinyali gösteriliyor.")
+                  print(message)
+              else:
 
-              print("Telegram HTTP:", telegram_response.status_code)
-              print("Telegram:", telegram_response.text)
+                  telegram_url = (
+                      "https://api.telegram.org/bot"
+                      f"{token}/sendMessage"
+                  )
 
-              if telegram_response.status_code != 200:
-                  raise SystemExit(1)
+                  telegram_response = requests.post(
+                      telegram_url,
+                      data={
+                          "chat_id": chat_id,
+                          "text": message
+                      },
+                      timeout=20
+                  )
 
-              print("Telegram mesajı gönderildi.")
+                  print(
+                      "Telegram HTTP:",
+                      telegram_response.status_code
+                  )
+
+                  print(
+                      "Telegram:",
+                      telegram_response.text
+                  )
+
+                  if telegram_response.status_code != 200:
+                      raise SystemExit(1)
+
+                  print("Telegram mesajı gönderildi.")
 
           else:
               print("Yeni BUY/SELL yok.")
 
           PY
-
