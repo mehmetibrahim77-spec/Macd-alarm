@@ -2,12 +2,16 @@ name: MACD Alarm
 
 on:
   schedule:
-    - cron: '5 0,4,8,12,16,20 * * *'
+    - cron: "*/15 * * * *"
   workflow_dispatch:
 
 jobs:
   macd:
     runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        interval: ["15m", "1h", "4h", "1d"]
 
     steps:
       - name: MACD kontrol
@@ -23,72 +27,87 @@ jobs:
           import pandas as pd
 
           SYMBOL = "BTCUSDT"
+          INTERVAL = "${{ matrix.interval }}"
 
-          url = "https://api.binance.com/api/v3/klines"
+          # Binance ana API yerine public market-data endpoint
+          url = "https://data-api.binance.vision/api/v3/klines"
 
           response = requests.get(
               url,
               params={
                   "symbol": SYMBOL,
-                  "interval": "4h",
+                  "interval": INTERVAL,
                   "limit": 200
               },
-              timeout=15
+              timeout=20
           )
 
-          print("Binance HTTP:", response.status_code)
+          print("HTTP:", response.status_code)
+
+          if response.status_code != 200:
+              print(response.text)
+              raise SystemExit(1)
 
           data = response.json()
 
-          # Binance hata döndürdüyse burada dur
-          if not isinstance(data, list):
-              print("Binance API hatası:")
-              print(data)
-              raise SystemExit(1)
-
-          if len(data) < 30:
-              print("Yeterli mum verisi yok.")
+          if not isinstance(data, list) or len(data) < 50:
+              print("Yeterli veri yok.")
               raise SystemExit(1)
 
           df = pd.DataFrame(data)
 
           df["close"] = pd.to_numeric(df[4])
 
-          # Açık olan son 4 saatlik mumu kullanma
+          # Açık mumu kullanma
           df = df.iloc[:-1].copy()
 
-          # EMA 12
+          # MACD
           ema12 = df["close"].ewm(
               span=12,
               adjust=False
           ).mean()
 
-          # EMA 26
           ema26 = df["close"].ewm(
               span=26,
               adjust=False
           ).mean()
 
-          # MACD
           macd = ema12 - ema26
 
-          current = macd.iloc[-1]
-          previous = macd.iloc[-2]
+          # Signal = MACD'nin 9 EMA'sı
+          signal = macd.ewm(
+              span=9,
+              adjust=False
+          ).mean()
 
-          current_green = current > 0
-          previous_green = previous > 0
+          previous_macd = macd.iloc[-2]
+          current_macd = macd.iloc[-1]
 
-          print("Önceki MACD:", previous)
-          print("Güncel MACD:", current)
+          previous_signal = signal.iloc[-2]
+          current_signal = signal.iloc[-1]
 
-          # Kırmızı grup → Yeşil grup
-          if not previous_green and current_green:
+          print("Timeframe:", INTERVAL)
+          print("Previous MACD:", previous_macd)
+          print("Current MACD:", current_macd)
+          print("Previous Signal:", previous_signal)
+          print("Current Signal:", current_signal)
+
+          # MACD signal'i yukarı keserse AL
+          buy = (
+              previous_macd <= previous_signal
+              and current_macd > current_signal
+          )
+
+          # MACD signal'i aşağı keserse SAT
+          sell = (
+              previous_macd >= previous_signal
+              and current_macd < current_signal
+          )
+
+          if buy:
               action = "BUY 🟢"
-
-          # Yeşil grup → Kırmızı grup
-          elif previous_green and not current_green:
+          elif sell:
               action = "SELL 🔴"
-
           else:
               action = None
 
@@ -96,18 +115,20 @@ jobs:
 
           if action:
 
-              price = df["close"].iloc[-1]
+              price = float(df["close"].iloc[-1])
 
               message = (
-                  f"MACD 4H ALARM\n\n"
+                  f"MACD ALARM\n\n"
                   f"Coin: {SYMBOL}\n"
+                  f"Timeframe: {INTERVAL}\n"
                   f"Sinyal: {action}\n"
                   f"Fiyat: {price:.2f}\n"
-                  f"MACD: {current:.6f}"
+                  f"MACD: {current_macd:.6f}\n"
+                  f"Signal: {current_signal:.6f}"
               )
 
               telegram_url = (
-                  f"https://api.telegram.org/bot"
+                  "https://api.telegram.org/bot"
                   f"{os.environ['TELEGRAM_BOT_TOKEN']}/sendMessage"
               )
 
@@ -117,11 +138,11 @@ jobs:
                       "chat_id": os.environ["TELEGRAM_CHAT_ID"],
                       "text": message
                   },
-                  timeout=15
+                  timeout=20
               )
 
               print("Telegram HTTP:", telegram_response.status_code)
-              print("Telegram cevap:", telegram_response.text)
+              print("Telegram:", telegram_response.text)
 
               if telegram_response.status_code != 200:
                   raise SystemExit(1)
@@ -132,3 +153,4 @@ jobs:
               print("Yeni BUY/SELL yok.")
 
           PY
+
