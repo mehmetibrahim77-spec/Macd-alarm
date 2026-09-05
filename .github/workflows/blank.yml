@@ -10,44 +10,57 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Python kurulumu
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
       - name: MACD Top 100 - 4H
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
         run: |
           pip install requests pandas
 
           python - <<'PY'
           import os
+          import time
           import requests
           import pandas as pd
-          import time
+
+          BINANCE = "https://api.binance.com"
 
           TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
           CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-          def telegram(msg):
-              requests.post(
-                  f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-                  data={"chat_id": CHAT_ID, "text": msg},
+          def send_telegram(message):
+              url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+              response = requests.post(
+                  url,
+                  data={
+                      "chat_id": CHAT_ID,
+                      "text": message
+                  },
                   timeout=20
               )
+              print("Telegram:", response.status_code)
 
-          # Binance'teki 24 saatlik hacme göre Top 100 USDT
+          # TOP 100 USDT COIN
           data = requests.get(
-              "https://api.binance.com/api/v3/ticker/24hr",
+              f"{BINANCE}/api/v3/ticker/24hr",
               timeout=20
           ).json()
 
           coins = []
 
-          for x in data:
-              symbol = x["symbol"]
+          for item in data:
+              symbol = item["symbol"]
 
               if not symbol.endswith("USDT"):
                   continue
 
-              if any(symbol.endswith(s) for s in [
+              if any(x in symbol for x in [
                   "UPUSDT",
                   "DOWNUSDT",
                   "BULLUSDT",
@@ -56,9 +69,8 @@ jobs:
                   continue
 
               try:
-                  coins.append(
-                      (symbol, float(x["quoteVolume"]))
-                  )
+                  volume = float(item["quoteVolume"])
+                  coins.append((symbol, volume))
               except:
                   pass
 
@@ -69,26 +81,31 @@ jobs:
 
           symbols = [x[0] for x in coins[:100]]
 
-          print(f"Top 100 coin taranıyor: {len(symbols)}")
+          print(f"Top 100 taranıyor: {len(symbols)} coin")
 
+          # HER COIN
           for symbol in symbols:
 
               try:
 
-                  klines = requests.get(
-                      "https://api.binance.com/api/v3/klines",
+                  response = requests.get(
+                      f"{BINANCE}/api/v3/klines",
                       params={
                           "symbol": symbol,
                           "interval": "4h",
                           "limit": 100
                       },
                       timeout=20
-                  ).json()
+                  )
 
-                  if not isinstance(klines, list) or len(klines) < 35:
+                  klines = response.json()
+
+                  if not isinstance(klines, list):
                       continue
 
-                  # Kapanmış 4H mumların kapanış fiyatları
+                  if len(klines) < 35:
+                      continue
+
                   closes = pd.Series(
                       [float(k[4]) for k in klines]
                   )
@@ -106,17 +123,16 @@ jobs:
 
                   macd = ema12 - ema26
 
-                  # Signal 9
+                  # SIGNAL 9
                   signal = macd.ewm(
                       span=9,
                       adjust=False
                   ).mean()
 
-                  # Histogram
+                  # HISTOGRAM
                   histogram = macd - signal
 
-                  # Son mum Binance'te hâlâ oluşuyor olabilir.
-                  # Bu nedenle son kapanmış mumu kullanıyoruz.
+                  # SON KAPANMIŞ 4H MUM
                   previous = histogram.iloc[-3]
                   current = histogram.iloc[-2]
 
@@ -124,11 +140,11 @@ jobs:
 
                   alarm = None
 
-                  # 🔴 KIRMIZIDAN 🟢 YEŞİLE
+                  # 🔴 → 🟢 = AL
                   if previous < 0 and current >= 0:
                       alarm = "AL 🟢"
 
-                  # 🟢 YEŞİLDEN 🔴 KIRMIZIYA
+                  # 🟢 → 🔴 = SAT
                   elif previous >= 0 and current < 0:
                       alarm = "SAT 🔴"
 
@@ -140,16 +156,19 @@ jobs:
                           "Timeframe: 4H\n"
                           f"Sinyal: {alarm}\n"
                           f"Fiyat: {price:.8f}\n\n"
-                          "MACD histogram renk değiştirdi."
+                          f"Histogram: {previous:.8f} → {current:.8f}"
                       )
 
                       print(message)
 
-                      telegram(message)
+                      send_telegram(message)
 
                       time.sleep(1)
 
               except Exception as e:
+
                   print(f"{symbol} hata: {e}")
+
+          print("MACD Top 100 - 4H taraması tamamlandı.")
 
           PY
