@@ -15,7 +15,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: MACD Top 100 - 4H
+      - name: CoinGecko 4H MACD TEST
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -24,190 +24,85 @@ jobs:
           pip install requests pandas
 
           python - <<'PY'
-          import os
-          import time
           import requests
           import pandas as pd
 
-          BINANCE = "https://api.binance.com"
+          # BTC test
+          url = "https://api.coingecko.com/api/v3/coins/bitcoin/ohlc"
 
-          TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-          CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+          params = {
+              "vs_currency": "usd",
+              "days": "30"
+          }
 
-          def send_telegram(message):
-              url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-
-              response = requests.post(
-                  url,
-                  data={
-                      "chat_id": CHAT_ID,
-                      "text": message
-                  },
-                  timeout=20
-              )
-
-              print("Telegram:", response.status_code)
-
-          # Binance 24 saatlik veriyi al
-          response = requests.get(
-              f"{BINANCE}/api/v3/ticker/24hr",
-              timeout=20
+          r = requests.get(
+              url,
+              params=params,
+              timeout=30
           )
 
-          response.raise_for_status()
+          print("HTTP:", r.status_code)
+          print("URL:", r.url)
+          print("Cevap:", r.text[:500])
 
-          data = response.json()
+          r.raise_for_status()
 
-          # Binance'in liste döndürdüğünden emin ol
+          data = r.json()
+
           if not isinstance(data, list):
               raise RuntimeError(
-                  f"Binance beklenmeyen cevap döndürdü: {data}"
+                  f"Beklenmeyen cevap: {data}"
               )
 
-          coins = []
+          print("Toplam mum:", len(data))
 
-          for item in data:
+          closes = pd.Series([
+              float(x[4])
+              for x in data
+          ])
 
-              if not isinstance(item, dict):
-                  continue
-
-              symbol = item.get("symbol", "")
-
-              if not symbol.endswith("USDT"):
-                  continue
-
-              # Kaldıraçlı tokenları çıkar
-              if any(x in symbol for x in [
-                  "UPUSDT",
-                  "DOWNUSDT",
-                  "BULLUSDT",
-                  "BEARUSDT"
-              ]):
-                  continue
-
-              try:
-                  volume = float(item["quoteVolume"])
-                  coins.append((symbol, volume))
-              except:
-                  continue
-
-          # Hacme göre sırala
-          coins.sort(
-              key=lambda x: x[1],
-              reverse=True
-          )
-
-          symbols = [
-              x[0]
-              for x in coins[:100]
-          ]
-
-          print(f"Top 100 coin bulundu: {len(symbols)}")
-
-          if len(symbols) == 0:
+          if len(closes) < 35:
               raise RuntimeError(
-                  "Binance'ten USDT coin listesi alınamadı."
+                  "MACD için yeterli mum yok."
               )
 
-          # Her coin için 4H MACD
-          for symbol in symbols:
+          ema12 = closes.ewm(
+              span=12,
+              adjust=False
+          ).mean()
 
-              try:
+          ema26 = closes.ewm(
+              span=26,
+              adjust=False
+          ).mean()
 
-                  response = requests.get(
-                      f"{BINANCE}/api/v3/klines",
-                      params={
-                          "symbol": symbol,
-                          "interval": "4h",
-                          "limit": 100
-                      },
-                      timeout=20
-                  )
+          macd = ema12 - ema26
 
-                  if response.status_code != 200:
-                      print(
-                          f"{symbol}: Binance HTTP {response.status_code}"
-                      )
-                      continue
+          signal = macd.ewm(
+              span=9,
+              adjust=False
+          ).mean()
 
-                  klines = response.json()
+          histogram = macd - signal
 
-                  if not isinstance(klines, list):
-                      continue
+          previous = histogram.iloc[-2]
+          current = histogram.iloc[-1]
 
-                  if len(klines) < 35:
-                      continue
+          print("--------------------------------")
+          print("BTC TEST")
+          print("Önceki histogram:", previous)
+          print("Son histogram:", current)
 
-                  # Kapanış fiyatları
-                  closes = pd.Series([
-                      float(k[4])
-                      for k in klines
-                  ])
+          if previous < 0 and current >= 0:
+              print("🟢 AL SİNYALİ")
 
-                  # MACD 12 / 26
-                  ema12 = closes.ewm(
-                      span=12,
-                      adjust=False
-                  ).mean()
+          elif previous >= 0 and current < 0:
+              print("🔴 SAT SİNYALİ")
 
-                  ema26 = closes.ewm(
-                      span=26,
-                      adjust=False
-                  ).mean()
+          else:
+              print("Sinyal yok.")
 
-                  macd = ema12 - ema26
-
-                  # Signal 9
-                  signal = macd.ewm(
-                      span=9,
-                      adjust=False
-                  ).mean()
-
-                  # Histogram
-                  histogram = macd - signal
-
-                  # Son kapanmış 4H mum
-                  previous = histogram.iloc[-3]
-                  current = histogram.iloc[-2]
-
-                  price = closes.iloc[-2]
-
-                  alarm = None
-
-                  # 🔴 → 🟢
-                  if previous < 0 and current >= 0:
-                      alarm = "AL 🟢"
-
-                  # 🟢 → 🔴
-                  elif previous >= 0 and current < 0:
-                      alarm = "SAT 🔴"
-
-                  if alarm:
-
-                      message = (
-                          "🚨 MACD 4H ALARM 🚨\n\n"
-                          f"Coin: {symbol}\n"
-                          "Timeframe: 4H\n"
-                          f"Sinyal: {alarm}\n"
-                          f"Fiyat: {price:.8f}\n\n"
-                          f"Histogram: "
-                          f"{previous:.8f} → {current:.8f}"
-                      )
-
-                      print(message)
-
-                      send_telegram(message)
-
-                      time.sleep(1)
-
-              except Exception as e:
-
-                  print(
-                      f"{symbol} hata: {type(e).__name__}: {e}"
-                  )
-
-          print(
-              "✅ MACD Top 100 - 4H taraması tamamlandı."
-          )
+          print("--------------------------------")
+          print("✅ CoinGecko 4H MACD TEST BAŞARILI")
 
           PY
