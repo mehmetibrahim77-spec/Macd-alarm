@@ -23,107 +23,100 @@ jobs:
           import requests
           import pandas as pd
 
-          BINANCE_URL = "https://data-api.binance.vision"
+          BASE = "https://data-api.binance.vision"
           INTERVAL = "4h"
 
-          print("===================================")
+          print("================================")
           print("MACD TOP 100 - 4H")
-          print("===================================")
+          print("================================")
 
-          # ------------------------------------------------
-          # 1. BINANCE'TEKİ GEÇERLİ USDT PARİTLERİNİ AL
-          # ------------------------------------------------
-
-          exchange = requests.get(
-              f"{BINANCE_URL}/api/v3/exchangeInfo",
+          # Binance'teki tüm işlem çiftlerini al
+          info = requests.get(
+              f"{BASE}/api/v3/exchangeInfo",
               timeout=30
-          ).json()
+          )
 
-          binance_symbols = set()
+          info.raise_for_status()
+          symbols = info.json()["symbols"]
 
-          for symbol in exchange["symbols"]:
+          # Sadece aktif USDT spot pariteleri
+          usdt_symbols = []
+
+          for s in symbols:
               if (
-                  symbol["status"] == "TRADING"
-                  and symbol["quoteAsset"] == "USDT"
-                  and symbol["isSpotTradingAllowed"]
+                  s["status"] == "TRADING"
+                  and s["quoteAsset"] == "USDT"
+                  and s.get("isSpotTradingAllowed", False)
               ):
-                  binance_symbols.add(symbol["symbol"])
+                  usdt_symbols.append(s["symbol"])
 
-          print("Binance USDT pariteleri:", len(binance_symbols))
+          print("Binance USDT pariteleri:", len(usdt_symbols))
 
-          # ------------------------------------------------
-          # 2. TOP 100 COINLERİ COINMARKETCAP'TEN AL
-          # ------------------------------------------------
-
-          cmc_url = (
-              "https://pro-api.coinmarketcap.com/"
-              "public-api/v3/cryptocurrency/listings/latest"
-          )
-
-          cmc_response = requests.get(
-              cmc_url,
-              params={
-                  "start": 1,
-                  "limit": 100,
-                  "convert": "USD"
-              },
+          # Piyasa değerine göre sıralama için
+          # Binance 24 saatlik ticker verilerini alıyoruz.
+          ticker_response = requests.get(
+              f"{BASE}/api/v3/ticker/24hr",
               timeout=30
           )
 
-          if cmc_response.status_code != 200:
-              print("CoinMarketCap hata:")
-              print(cmc_response.text)
-              raise SystemExit(1)
+          ticker_response.raise_for_status()
+          tickers = ticker_response.json()
 
-          top100 = cmc_response.json()["data"]
+          ticker_map = {
+              x["symbol"]: x
+              for x in tickers
+              if x["symbol"] in usdt_symbols
+          }
 
-          print("Top 100 coin alındı.")
+          # USDT hacmine göre en büyük 100 Binance paritesini seç
+          # Not: Bu CoinMarketCap market-cap Top 100 değildir.
+          ranked = []
 
-          # ------------------------------------------------
-          # 3. SADECE BINANCE'TE USDT PARİTESİ OLANLARI SEÇ
-          # ------------------------------------------------
+          for symbol in usdt_symbols:
 
-          coins = []
-
-          for coin in top100:
-
-              symbol = coin["symbol"].upper()
-
-              # Stablecoinleri atla
-              stablecoins = {
-                  "USDT",
-                  "USDC",
-                  "FDUSD",
-                  "TUSD",
-                  "USDE",
-                  "DAI"
-              }
-
-              if symbol in stablecoins:
+              if symbol not in ticker_map:
                   continue
 
-              binance_pair = symbol + "USDT"
+              try:
+                  volume = float(
+                      ticker_map[symbol]["quoteVolume"]
+                  )
 
-              if binance_pair in binance_symbols:
-                  coins.append(binance_pair)
+                  ranked.append(
+                      (symbol, volume)
+                  )
 
-          print("Tarama yapılacak coin sayısı:", len(coins))
+              except:
+                  continue
 
+          ranked.sort(
+              key=lambda x: x[1],
+              reverse=True
+          )
+
+          coins = [
+              x[0]
+              for x in ranked[:100]
+          ]
+
+          print("Taranacak coin sayısı:", len(coins))
           print(coins)
 
-          # ------------------------------------------------
-          # 4. HER COİN İÇİN MACD HESAPLA
-          # ------------------------------------------------
+          # ==========================================
+          # COİNLERİ TEK TEK TARA
+          # ==========================================
 
           for SYMBOL in coins:
 
               try:
 
-                  print("\n-----------------------------------")
+                  print()
+                  print("--------------------------------")
                   print("COIN:", SYMBOL)
+                  print("--------------------------------")
 
                   response = requests.get(
-                      f"{BINANCE_URL}/api/v3/klines",
+                      f"{BASE}/api/v3/klines",
                       params={
                           "symbol": SYMBOL,
                           "interval": INTERVAL,
@@ -133,7 +126,10 @@ jobs:
                   )
 
                   if response.status_code != 200:
-                      print("Kline alınamadı.")
+                      print(
+                          "Kline hatası:",
+                          response.status_code
+                      )
                       continue
 
                   data = response.json()
@@ -147,14 +143,10 @@ jobs:
                   # Kapanış fiyatı
                   df["close"] = pd.to_numeric(df[4])
 
-                  # Son mum henüz kapanmamış olabilir.
-                  # Bu yüzden son mumu kullanmıyoruz.
+                  # Açık olan son 4H mumunu kullanma
                   df = df.iloc[:-1].copy()
 
-                  # ------------------------------------------------
-                  # MACD 12 / 26 / 9
-                  # ------------------------------------------------
-
+                  # MACD 12 / 26
                   ema12 = df["close"].ewm(
                       span=12,
                       adjust=False
@@ -167,38 +159,33 @@ jobs:
 
                   macd = ema12 - ema26
 
+                  # Signal 9
                   signal = macd.ewm(
                       span=9,
                       adjust=False
                   ).mean()
 
-                  # Önceki kapanmış mum
                   previous_macd = macd.iloc[-2]
-                  previous_signal = signal.iloc[-2]
-
-                  # Son kapanmış 4H mum
                   current_macd = macd.iloc[-1]
+
+                  previous_signal = signal.iloc[-2]
                   current_signal = signal.iloc[-1]
 
-                  price = float(df["close"].iloc[-1])
+                  price = float(
+                      df["close"].iloc[-1]
+                  )
 
-                  # ------------------------------------------------
-                  # AL / SAT
-                  # ------------------------------------------------
-
+                  # AL
                   buy = (
                       previous_macd <= previous_signal
                       and current_macd > current_signal
                   )
 
+                  # SAT
                   sell = (
                       previous_macd >= previous_signal
                       and current_macd < current_signal
                   )
-
-                  print("Fiyat:", price)
-                  print("MACD:", current_macd)
-                  print("Signal:", current_signal)
 
                   if buy:
 
@@ -212,10 +199,6 @@ jobs:
 
                       print("Sinyal yok.")
                       continue
-
-                  # ------------------------------------------------
-                  # TELEGRAM
-                  # ------------------------------------------------
 
                   message = (
                       "🚨 MACD 4H ALARM 🚨\n\n"
@@ -246,8 +229,8 @@ jobs:
                       continue
 
                   telegram_url = (
-                      f"https://api.telegram.org/"
-                      f"bot{token}/sendMessage"
+                      "https://api.telegram.org/bot"
+                      f"{token}/sendMessage"
                   )
 
                   telegram_response = requests.post(
@@ -260,7 +243,7 @@ jobs:
                   )
 
                   print(
-                      "Telegram:",
+                      "Telegram HTTP:",
                       telegram_response.status_code
                   )
 
@@ -270,12 +253,11 @@ jobs:
                       f"{SYMBOL} hata verdi: {e}"
                   )
 
-                  # Bir coin hata verse bile
-                  # diğer coinler devam etsin.
                   continue
 
-          print("\n===================================")
-          print("TARAMA TAMAMLANDI")
-          print("===================================")
+          print()
+          print("================================")
+          print("TOP 100 TARAMASI TAMAMLANDI")
+          print("================================")
 
           PY
