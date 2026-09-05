@@ -1,4 +1,5 @@
 name: MACD Alarm
+
 on:
   schedule:
     - cron: '5 0,4,8,12,16,20 * * *'
@@ -23,25 +24,52 @@ jobs:
 
           SYMBOL = "BTCUSDT"
 
-          data = requests.get(
-              "https://api.binance.com/api/v3/klines",
+          url = "https://api.binance.com/api/v3/klines"
+
+          response = requests.get(
+              url,
               params={
                   "symbol": SYMBOL,
                   "interval": "4h",
                   "limit": 200
-              }
-          ).json()
+              },
+              timeout=15
+          )
+
+          print("Binance HTTP:", response.status_code)
+
+          data = response.json()
+
+          # Binance hata döndürdüyse burada dur
+          if not isinstance(data, list):
+              print("Binance API hatası:")
+              print(data)
+              raise SystemExit(1)
+
+          if len(data) < 30:
+              print("Yeterli mum verisi yok.")
+              raise SystemExit(1)
 
           df = pd.DataFrame(data)
 
-          df["close"] = df[4].astype(float)
+          df["close"] = pd.to_numeric(df[4])
 
-          # Açık olan son mumu kullanma
-          df = df.iloc[:-1]
+          # Açık olan son 4 saatlik mumu kullanma
+          df = df.iloc[:-1].copy()
 
-          ema12 = df["close"].ewm(span=12, adjust=False).mean()
-          ema26 = df["close"].ewm(span=26, adjust=False).mean()
+          # EMA 12
+          ema12 = df["close"].ewm(
+              span=12,
+              adjust=False
+          ).mean()
 
+          # EMA 26
+          ema26 = df["close"].ewm(
+              span=26,
+              adjust=False
+          ).mean()
+
+          # MACD
           macd = ema12 - ema26
 
           current = macd.iloc[-1]
@@ -50,18 +78,24 @@ jobs:
           current_green = current > 0
           previous_green = previous > 0
 
+          print("Önceki MACD:", previous)
+          print("Güncel MACD:", current)
+
+          # Kırmızı grup → Yeşil grup
           if not previous_green and current_green:
               action = "BUY 🟢"
+
+          # Yeşil grup → Kırmızı grup
           elif previous_green and not current_green:
               action = "SELL 🔴"
+
           else:
               action = None
 
-          print("Önceki MACD:", previous)
-          print("Güncel MACD:", current)
           print("Sinyal:", action)
 
           if action:
+
               price = df["close"].iloc[-1]
 
               message = (
@@ -72,15 +106,29 @@ jobs:
                   f"MACD: {current:.6f}"
               )
 
-              requests.post(
-                  f"https://api.telegram.org/bot{os.environ['TELEGRAM_BOT_TOKEN']}/sendMessage",
+              telegram_url = (
+                  f"https://api.telegram.org/bot"
+                  f"{os.environ['TELEGRAM_BOT_TOKEN']}/sendMessage"
+              )
+
+              telegram_response = requests.post(
+                  telegram_url,
                   data={
                       "chat_id": os.environ["TELEGRAM_CHAT_ID"],
                       "text": message
-                  }
+                  },
+                  timeout=15
               )
 
+              print("Telegram HTTP:", telegram_response.status_code)
+              print("Telegram cevap:", telegram_response.text)
+
+              if telegram_response.status_code != 200:
+                  raise SystemExit(1)
+
               print("Telegram mesajı gönderildi.")
+
           else:
               print("Yeni BUY/SELL yok.")
+
           PY
