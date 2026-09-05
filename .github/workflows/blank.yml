@@ -15,19 +15,18 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Gerekli paketleri kur
+      - name: Paketleri kur
         run: |
-          pip install requests pandas
+          pip install requests
 
-      - name: MACD tara ve Telegram gönder
+      - name: Top 200 Market Cap + 4H MACD
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python <<'PY'
           import requests
-          import pandas as pd
-          import time
+          import os
           import re
 
           TV_URL = "https://scanner.tradingview.com/crypto/scan"
@@ -40,16 +39,71 @@ jobs:
           }
 
           # ============================================================
-          # 1) GERÇEK MARKET CAP TOP 200
+          # 1 — GERÇEK TOP 200 MARKET CAP
+          # CoinGecko market-cap sıralaması
           # ============================================================
 
-          payload = {
+          cg_url = (
+              "https://api.coingecko.com/api/v3/coins/markets"
+              "?vs_currency=usd"
+              "&order=market_cap_desc"
+              "&per_page=200"
+              "&page=1"
+              "&sparkline=false"
+          )
+
+          cg = requests.get(cg_url, timeout=30)
+          cg.raise_for_status()
+
+          market_coins = cg.json()
+
+          if not market_coins:
+              raise Exception("CoinGecko Top 200 alınamadı.")
+
+          print("========================================")
+          print("COINGECKO MARKET CAP TOP 200")
+          print("Coin sayısı:", len(market_coins))
+          print("========================================")
+
+          # CoinGecko symbol -> market cap sırası
+          top_coins = []
+
+          for coin in market_coins:
+              coin_id = coin.get("id")
+              symbol = str(coin.get("symbol", "")).upper()
+
+              if not symbol:
+                  continue
+
+              top_coins.append({
+                  "id": coin_id,
+                  "symbol": symbol,
+                  "name": coin.get("name"),
+                  "market_cap": coin.get("market_cap") or 0,
+                  "rank": coin.get("market_cap_rank")
+              })
+
+          # Aynı sembolden olası tekrarları kaldır
+          allowed_symbols = {}
+
+          for coin in top_coins:
+              sym = coin["symbol"]
+
+              if sym not in allowed_symbols:
+                  allowed_symbols[sym] = coin
+
+          print("Benzersiz coin:", len(allowed_symbols))
+
+          # ============================================================
+          # 2 — TRADINGVIEW'DAN USDT PARİTELERİNİ BUL
+          #
+          # Buradaki hacim artık TOP 200 seçmek için kullanılmıyor.
+          # Sadece aynı coin için hangi USDT paritesini kullanacağımızı
+          # seçmek için kullanılıyor.
+          # ============================================================
+
+          tv_payload = {
               "filter": [
-                  {
-                      "left": "market_cap_basic",
-                      "operation": "greater",
-                      "right": 0
-                  },
                   {
                       "left": "name",
                       "operation": "match",
@@ -70,169 +124,124 @@ jobs:
               },
               "columns": [
                   "name",
-                  "ticker",
-                  "market_cap_basic",
-                  "exchange",
-                  "close"
+                  "close",
+                  "volume"
               ],
               "sort": {
-                  "sortBy": "market_cap_basic",
+                  "sortBy": "volume",
                   "sortOrder": "desc"
               },
               "range": [
                   0,
-                  500
+                  1000
               ]
           }
 
-          r = requests.post(
+          tv = requests.post(
               TV_URL,
               headers=HEADERS,
-              json=payload,
+              json=tv_payload,
               timeout=30
           )
 
-          r.raise_for_status()
+          tv.raise_for_status()
 
-          data = r.json().get("data", [])
+          tv_data = tv.json().get("data", [])
 
-          if not data:
-              raise Exception("TradingView Top 200 verisi alınamadı.")
+          if not tv_data:
+              raise Exception("TradingView USDT pariteleri alınamadı.")
 
           # ============================================================
-          # 2) SADECE GERÇEK USDT SPOT PARİTELERİ
+          # 3 — SADECE TOP 200 MARKET CAP COINLERİNİ EŞLEŞTİR
           # ============================================================
 
-          # Büyük CEX'ler.
-          # Böylece DEX / kaldıraçlı / garip token pariteleri
-          # mümkün olduğunca dışarıda tutulur.
-          allowed_exchanges = {
-              "BINANCE",
-              "BYBIT",
-              "OKX",
-              "COINBASE",
-              "KRAKEN",
-              "KUCOIN",
-              "GATEIO",
-              "BITGET",
-              "MEXC",
-              "BITFINEX",
-              "CRYPTOCOM"
-          }
+          matched = {}
 
-          coins = []
+          for row in tv_data:
+              ticker_full = row.get("s", "")
+              values = row.get("d", [])
 
-          for item in data:
-              symbol = item.get("s", "")
-              values = item.get("d", [])
-
-              if len(values) < 5:
+              if not ticker_full or len(values) < 3:
                   continue
-
-              name = values[0]
-              ticker = values[1]
-              market_cap = values[2]
-              exchange = values[3]
-
-              if not ticker:
-                  continue
-
-              if not str(ticker).upper().endswith("USDT"):
-                  continue
-
-              if exchange and str(exchange).upper() not in allowed_exchanges:
-                  continue
-
-              if market_cap is None:
-                  continue
-
-              # Kaldıraçlı tokenleri ele
-              upper_name = str(name).upper()
-
-              bad_words = [
-                  "3L", "3S",
-                  "5L", "5S",
-                  "UP", "DOWN",
-                  "BULL", "BEAR",
-                  "LONG", "SHORT"
-              ]
-
-              if any(
-                  upper_name.endswith(x) or
-                  upper_name.endswith(x + "USDT")
-                  for x in bad_words
-              ):
-                  continue
-
-              coins.append({
-                  "ticker": ticker,
-                  "name": name,
-                  "market_cap": float(market_cap),
-                  "exchange": exchange
-              })
-
-          # Market cap'e göre tekrar sırala
-          coins.sort(
-              key=lambda x: x["market_cap"],
-              reverse=True
-          )
-
-          # Aynı coin birden fazla borsadaysa yalnızca ilkini al.
-          # Böylece 200 coin hedefliyoruz, 200 parite değil.
-          selected = []
-          seen_bases = set()
-
-          for coin in coins:
-
-              ticker = str(coin["ticker"])
 
               # Örn:
               # BINANCE:BTCUSDT
-              # BTCUSDT
-              base = ticker.split(":")[-1]
+              # BYBIT:ETHUSDT
+              # OKX:SOLUSDT
 
-              if base.endswith("USDT"):
-                  base = base[:-4]
+              pair = ticker_full.split(":")[-1].upper()
 
-              if base in seen_bases:
+              if not pair.endswith("USDT"):
                   continue
 
-              seen_bases.add(base)
-              selected.append(coin)
+              base = pair[:-4]
 
-              if len(selected) >= 200:
-                  break
+              if base not in allowed_symbols:
+                  continue
+
+              volume = values[2]
+
+              if volume is None:
+                  continue
+
+              try:
+                  volume = float(volume)
+              except:
+                  continue
+
+              # Aynı coin birden fazla borsada varsa
+              # TradingView'daki en likit USDT paritesini seç.
+              if (
+                  base not in matched
+                  or volume > matched[base]["volume"]
+              ):
+                  matched[base] = {
+                      "ticker": ticker_full,
+                      "base": base,
+                      "volume": volume
+                  }
+
+          # Market-cap sırasını koru
+          selected = []
+
+          for coin in top_coins:
+              sym = coin["symbol"]
+
+              if sym in matched:
+                  selected.append({
+                      "symbol": sym,
+                      "name": coin["name"],
+                      "rank": coin["rank"],
+                      "market_cap": coin["market_cap"],
+                      "ticker": matched[sym]["ticker"]
+                  })
 
           print("========================================")
-          print("MARKET CAP TOP 200")
-          print("Bulunan coin sayısı:", len(selected))
+          print("GERÇEK MARKET CAP TOP 200")
+          print("TradingView USDT eşleşmesi:", len(selected))
           print("========================================")
 
-          for i, coin in enumerate(selected[:20], 1):
+          for coin in selected[:200]:
               print(
-                  i,
-                  coin["name"],
-                  coin["ticker"],
-                  f"MCAP={coin['market_cap']:,.0f}"
+                  f"#{coin['rank']} "
+                  f"{coin['name']} "
+                  f"-> {coin['ticker']}"
               )
 
           if not selected:
-              raise Exception("Market Cap Top 200 listesi boş.")
+              raise Exception(
+                  "Top 200 market-cap coinlerinden "
+                  "TradingView USDT paritesi bulunamadı."
+              )
 
           # ============================================================
-          # 3) TOP 200 İÇİN 4H MACD VERİSİNİ ÇEK
+          # 4 — TRADINGVIEW 4H MACD
           # ============================================================
 
           tickers = [x["ticker"] for x in selected]
 
           macd_payload = {
-              "filter": [
-                  {
-                      "left": "name",
-                      "operation": "match",
-                      "right": ".*USDT$"
-                  }
-              ],
+              "filter": [],
               "options": {
                   "lang": "en"
               },
@@ -260,31 +269,42 @@ jobs:
               ],
               "range": [
                   0,
-                  500
+                  300
               ]
           }
 
-          r2 = requests.post(
+          macd_response = requests.post(
               TV_URL,
               headers=HEADERS,
               json=macd_payload,
               timeout=30
           )
 
-          r2.raise_for_status()
+          macd_response.raise_for_status()
 
-          macd_data = r2.json().get("data", [])
+          macd_data = macd_response.json().get("data", [])
+
+          print("MACD verisi:", len(macd_data))
 
           # ============================================================
-          # 4) MACD HISTOGRAM RENK / YÖN DEĞİŞİMİ
+          # 5 — HISTOGRAM YÖN DEĞİŞİMİ
+          #
+          # h1 = son kapanmış 4H
+          # h2 = önceki kapanmış 4H
+          # h3 = daha önceki 4H
+          #
+          # KIRMIZI -> YEŞİL = AL
+          # YEŞİL -> KIRMIZI = SAT
+          #
+          # 0 ÇİZGİSİNİ KESMEK GEREKMİYOR.
           # ============================================================
 
           signals = []
 
-          for item in macd_data:
+          for row in macd_data:
 
-              symbol = item.get("s", "")
-              values = item.get("d", [])
+              ticker_full = row.get("s", "")
+              values = row.get("d", [])
 
               if len(values) < 8:
                   continue
@@ -301,39 +321,44 @@ jobs:
               macd2 = values[6]
               signal2 = values[7]
 
-              numbers = [
-                  macd0, signal0,
-                  macd1, signal1,
-                  macd2, signal2
+              nums = [
+                  macd0,
+                  signal0,
+                  macd1,
+                  signal1,
+                  macd2,
+                  signal2
               ]
 
-              if any(x is None for x in numbers):
+              if any(x is None for x in nums):
                   continue
 
-              # Histogram
-              h1 = macd0 - signal0
-              h2 = macd1 - signal1
-              h3 = macd2 - signal2
+              try:
+                  h1 = float(macd0) - float(signal0)
+                  h2 = float(macd1) - float(signal1)
+                  h3 = float(macd2) - float(signal2)
+              except:
+                  continue
 
-              # Son KAPANMIŞ 4H mumdaki histogram eğimi
               current_slope = h1 - h2
-
-              # Ondan önceki kapanmış mumdaki histogram eğimi
               previous_slope = h2 - h3
 
               signal = None
 
-              # 🔴 Düşüyordu -> 🟢 yükselmeye başladı
+              # 🔴 -> 🟢
               if previous_slope <= 0 and current_slope > 0:
                   signal = "AL 🟢"
 
-              # 🟢 Yükseliyordu -> 🔴 düşmeye başladı
+              # 🟢 -> 🔴
               elif previous_slope >= 0 and current_slope < 0:
                   signal = "SAT 🔴"
 
               if signal:
+
+                  coin_symbol = ticker_full.split(":")[-1]
+
                   signals.append({
-                      "symbol": symbol,
+                      "symbol": coin_symbol,
                       "name": name,
                       "price": price,
                       "signal": signal,
@@ -341,47 +366,39 @@ jobs:
                   })
 
           # ============================================================
-          # 5) TELEGRAM
+          # 6 — TELEGRAM
           # ============================================================
-
-          token = "${TELEGRAM_BOT_TOKEN}"
-          chat_id = "${TELEGRAM_CHAT_ID}"
-
-          # GitHub env değerlerini Python'a güvenli şekilde al
-          import os
 
           token = os.environ.get("TELEGRAM_BOT_TOKEN")
           chat_id = os.environ.get("TELEGRAM_CHAT_ID")
 
           if not token or not chat_id:
               raise Exception(
-                  "TELEGRAM_BOT_TOKEN veya TELEGRAM_CHAT_ID bulunamadı."
+                  "TELEGRAM_BOT_TOKEN veya TELEGRAM_CHAT_ID yok."
               )
 
           if not signals:
-              print("Bu taramada yeni MACD sinyali yok.")
+              print("Yeni MACD sinyali yok.")
               exit(0)
 
           for s in signals:
 
-              symbol = s["symbol"].split(":")[-1]
-
               message = (
                   "🚨 MACD 4H ALARM 🚨\n\n"
-                  f"Coin: {symbol}\n"
+                  f"Coin: {s['symbol']}\n"
                   "Timeframe: 4H\n"
                   f"Sinyal: {s['signal']}\n"
                   f"Fiyat: {s['price']}\n"
                   f"Histogram: {s['histogram']:.8f}\n\n"
-                  "📊 Market Cap Top 200"
+                  "🏆 Market Cap: TOP 200"
               )
 
-              url = (
+              telegram_url = (
                   f"https://api.telegram.org/bot{token}/sendMessage"
               )
 
               response = requests.post(
-                  url,
+                  telegram_url,
                   data={
                       "chat_id": chat_id,
                       "text": message
@@ -391,10 +408,14 @@ jobs:
 
               response.raise_for_status()
 
-              print("Telegram gönderildi:", symbol)
+              print(
+                  "Telegram gönderildi:",
+                  s["symbol"],
+                  s["signal"]
+              )
 
           print("========================================")
-          print("Tarama tamamlandı.")
-          print("Sinyal sayısı:", len(signals))
+          print("TARAMA TAMAMLANDI")
+          print("Sinyal:", len(signals))
           print("========================================")
           PY
