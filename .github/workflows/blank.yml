@@ -11,7 +11,7 @@ jobs:
 
     steps:
       - name: Python kurulumu
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
@@ -36,6 +36,7 @@ jobs:
 
           def send_telegram(message):
               url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+
               response = requests.post(
                   url,
                   data={
@@ -44,22 +45,38 @@ jobs:
                   },
                   timeout=20
               )
+
               print("Telegram:", response.status_code)
 
-          # TOP 100 USDT COIN
-          data = requests.get(
+          # Binance 24 saatlik veriyi al
+          response = requests.get(
               f"{BINANCE}/api/v3/ticker/24hr",
               timeout=20
-          ).json()
+          )
+
+          response.raise_for_status()
+
+          data = response.json()
+
+          # Binance'in liste döndürdüğünden emin ol
+          if not isinstance(data, list):
+              raise RuntimeError(
+                  f"Binance beklenmeyen cevap döndürdü: {data}"
+              )
 
           coins = []
 
           for item in data:
-              symbol = item["symbol"]
+
+              if not isinstance(item, dict):
+                  continue
+
+              symbol = item.get("symbol", "")
 
               if not symbol.endswith("USDT"):
                   continue
 
+              # Kaldıraçlı tokenları çıkar
               if any(x in symbol for x in [
                   "UPUSDT",
                   "DOWNUSDT",
@@ -72,18 +89,27 @@ jobs:
                   volume = float(item["quoteVolume"])
                   coins.append((symbol, volume))
               except:
-                  pass
+                  continue
 
+          # Hacme göre sırala
           coins.sort(
               key=lambda x: x[1],
               reverse=True
           )
 
-          symbols = [x[0] for x in coins[:100]]
+          symbols = [
+              x[0]
+              for x in coins[:100]
+          ]
 
-          print(f"Top 100 taranıyor: {len(symbols)} coin")
+          print(f"Top 100 coin bulundu: {len(symbols)}")
 
-          # HER COIN
+          if len(symbols) == 0:
+              raise RuntimeError(
+                  "Binance'ten USDT coin listesi alınamadı."
+              )
+
+          # Her coin için 4H MACD
           for symbol in symbols:
 
               try:
@@ -98,6 +124,12 @@ jobs:
                       timeout=20
                   )
 
+                  if response.status_code != 200:
+                      print(
+                          f"{symbol}: Binance HTTP {response.status_code}"
+                      )
+                      continue
+
                   klines = response.json()
 
                   if not isinstance(klines, list):
@@ -106,9 +138,11 @@ jobs:
                   if len(klines) < 35:
                       continue
 
-                  closes = pd.Series(
-                      [float(k[4]) for k in klines]
-                  )
+                  # Kapanış fiyatları
+                  closes = pd.Series([
+                      float(k[4])
+                      for k in klines
+                  ])
 
                   # MACD 12 / 26
                   ema12 = closes.ewm(
@@ -123,16 +157,16 @@ jobs:
 
                   macd = ema12 - ema26
 
-                  # SIGNAL 9
+                  # Signal 9
                   signal = macd.ewm(
                       span=9,
                       adjust=False
                   ).mean()
 
-                  # HISTOGRAM
+                  # Histogram
                   histogram = macd - signal
 
-                  # SON KAPANMIŞ 4H MUM
+                  # Son kapanmış 4H mum
                   previous = histogram.iloc[-3]
                   current = histogram.iloc[-2]
 
@@ -140,11 +174,11 @@ jobs:
 
                   alarm = None
 
-                  # 🔴 → 🟢 = AL
+                  # 🔴 → 🟢
                   if previous < 0 and current >= 0:
                       alarm = "AL 🟢"
 
-                  # 🟢 → 🔴 = SAT
+                  # 🟢 → 🔴
                   elif previous >= 0 and current < 0:
                       alarm = "SAT 🔴"
 
@@ -156,7 +190,8 @@ jobs:
                           "Timeframe: 4H\n"
                           f"Sinyal: {alarm}\n"
                           f"Fiyat: {price:.8f}\n\n"
-                          f"Histogram: {previous:.8f} → {current:.8f}"
+                          f"Histogram: "
+                          f"{previous:.8f} → {current:.8f}"
                       )
 
                       print(message)
@@ -167,8 +202,12 @@ jobs:
 
               except Exception as e:
 
-                  print(f"{symbol} hata: {e}")
+                  print(
+                      f"{symbol} hata: {type(e).__name__}: {e}"
+                  )
 
-          print("MACD Top 100 - 4H taraması tamamlandı.")
+          print(
+              "✅ MACD Top 100 - 4H taraması tamamlandı."
+          )
 
           PY
