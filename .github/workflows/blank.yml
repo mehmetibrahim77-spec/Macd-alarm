@@ -1,20 +1,16 @@
-name: MACD Alarm
+name: MACD Top 100 - 4H
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "5 */4 * * *"
 
 jobs:
   macd:
     runs-on: ubuntu-latest
 
-    strategy:
-      matrix:
-        interval: ["15m", "1h", "4h", "1d"]
-
     steps:
-      - name: MACD kontrol
+      - name: MACD 4H Top 100
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -27,122 +23,231 @@ jobs:
           import requests
           import pandas as pd
 
-          SYMBOL = "BTCUSDT"
-          INTERVAL = "${{ matrix.interval }}"
+          BINANCE_URL = "https://data-api.binance.vision"
+          INTERVAL = "4h"
 
-          url = "https://data-api.binance.vision/api/v3/klines"
+          print("===================================")
+          print("MACD TOP 100 - 4H")
+          print("===================================")
 
-          response = requests.get(
-              url,
+          # ------------------------------------------------
+          # 1. BINANCE'TEKİ GEÇERLİ USDT PARİTLERİNİ AL
+          # ------------------------------------------------
+
+          exchange = requests.get(
+              f"{BINANCE_URL}/api/v3/exchangeInfo",
+              timeout=30
+          ).json()
+
+          binance_symbols = set()
+
+          for symbol in exchange["symbols"]:
+              if (
+                  symbol["status"] == "TRADING"
+                  and symbol["quoteAsset"] == "USDT"
+                  and symbol["isSpotTradingAllowed"]
+              ):
+                  binance_symbols.add(symbol["symbol"])
+
+          print("Binance USDT pariteleri:", len(binance_symbols))
+
+          # ------------------------------------------------
+          # 2. TOP 100 COINLERİ COINMARKETCAP'TEN AL
+          # ------------------------------------------------
+
+          cmc_url = (
+              "https://pro-api.coinmarketcap.com/"
+              "public-api/v3/cryptocurrency/listings/latest"
+          )
+
+          cmc_response = requests.get(
+              cmc_url,
               params={
-                  "symbol": SYMBOL,
-                  "interval": INTERVAL,
-                  "limit": 200
+                  "start": 1,
+                  "limit": 100,
+                  "convert": "USD"
               },
-              timeout=20
+              timeout=30
           )
 
-          print("Binance HTTP:", response.status_code)
-
-          if response.status_code != 200:
-              print(response.text)
+          if cmc_response.status_code != 200:
+              print("CoinMarketCap hata:")
+              print(cmc_response.text)
               raise SystemExit(1)
 
-          data = response.json()
+          top100 = cmc_response.json()["data"]
 
-          if not isinstance(data, list) or len(data) < 50:
-              print("Yeterli veri yok.")
-              raise SystemExit(1)
+          print("Top 100 coin alındı.")
 
-          df = pd.DataFrame(data)
+          # ------------------------------------------------
+          # 3. SADECE BINANCE'TE USDT PARİTESİ OLANLARI SEÇ
+          # ------------------------------------------------
 
-          df["close"] = pd.to_numeric(df[4])
+          coins = []
 
-          # Henüz kapanmamış mumu kullanma
-          df = df.iloc[:-1].copy()
+          for coin in top100:
 
-          # MACD
-          ema12 = df["close"].ewm(
-              span=12,
-              adjust=False
-          ).mean()
+              symbol = coin["symbol"].upper()
 
-          ema26 = df["close"].ewm(
-              span=26,
-              adjust=False
-          ).mean()
+              # Stablecoinleri atla
+              stablecoins = {
+                  "USDT",
+                  "USDC",
+                  "FDUSD",
+                  "TUSD",
+                  "USDE",
+                  "DAI"
+              }
 
-          macd = ema12 - ema26
+              if symbol in stablecoins:
+                  continue
 
-          # Signal çizgisi
-          signal = macd.ewm(
-              span=9,
-              adjust=False
-          ).mean()
+              binance_pair = symbol + "USDT"
 
-          previous_macd = macd.iloc[-2]
-          current_macd = macd.iloc[-1]
+              if binance_pair in binance_symbols:
+                  coins.append(binance_pair)
 
-          previous_signal = signal.iloc[-2]
-          current_signal = signal.iloc[-1]
+          print("Tarama yapılacak coin sayısı:", len(coins))
 
-          print()
-          print("================================")
-          print("COIN:", SYMBOL)
-          print("TIMEFRAME:", INTERVAL)
-          print("================================")
-          print("Previous MACD:", previous_macd)
-          print("Current MACD:", current_macd)
-          print("Previous Signal:", previous_signal)
-          print("Current Signal:", current_signal)
+          print(coins)
 
-          # MACD Signal'i yukarı keserse AL
-          buy = (
-              previous_macd <= previous_signal
-              and current_macd > current_signal
-          )
+          # ------------------------------------------------
+          # 4. HER COİN İÇİN MACD HESAPLA
+          # ------------------------------------------------
 
-          # MACD Signal'i aşağı keserse SAT
-          sell = (
-              previous_macd >= previous_signal
-              and current_macd < current_signal
-          )
+          for SYMBOL in coins:
 
-          if buy:
-              action = "BUY 🟢"
-          elif sell:
-              action = "SELL 🔴"
-          else:
-              action = None
+              try:
 
-          print("Sinyal:", action)
+                  print("\n-----------------------------------")
+                  print("COIN:", SYMBOL)
 
-          if action:
+                  response = requests.get(
+                      f"{BINANCE_URL}/api/v3/klines",
+                      params={
+                          "symbol": SYMBOL,
+                          "interval": INTERVAL,
+                          "limit": 200
+                      },
+                      timeout=20
+                  )
 
-              price = float(df["close"].iloc[-1])
+                  if response.status_code != 200:
+                      print("Kline alınamadı.")
+                      continue
 
-              message = (
-                  "MACD ALARM\n\n"
-                  f"Coin: {SYMBOL}\n"
-                  f"Timeframe: {INTERVAL}\n"
-                  f"Sinyal: {action}\n"
-                  f"Fiyat: {price:.2f}\n"
-                  f"MACD: {current_macd:.6f}\n"
-                  f"Signal: {current_signal:.6f}"
-              )
+                  data = response.json()
 
-              token = os.environ.get("TELEGRAM_BOT_TOKEN")
-              chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+                  if len(data) < 50:
+                      print("Yeterli veri yok.")
+                      continue
 
-              if not token or not chat_id:
-                  print("Telegram secret bulunamadı.")
-                  print("Sadece MACD sinyali gösteriliyor.")
+                  df = pd.DataFrame(data)
+
+                  # Kapanış fiyatı
+                  df["close"] = pd.to_numeric(df[4])
+
+                  # Son mum henüz kapanmamış olabilir.
+                  # Bu yüzden son mumu kullanmıyoruz.
+                  df = df.iloc[:-1].copy()
+
+                  # ------------------------------------------------
+                  # MACD 12 / 26 / 9
+                  # ------------------------------------------------
+
+                  ema12 = df["close"].ewm(
+                      span=12,
+                      adjust=False
+                  ).mean()
+
+                  ema26 = df["close"].ewm(
+                      span=26,
+                      adjust=False
+                  ).mean()
+
+                  macd = ema12 - ema26
+
+                  signal = macd.ewm(
+                      span=9,
+                      adjust=False
+                  ).mean()
+
+                  # Önceki kapanmış mum
+                  previous_macd = macd.iloc[-2]
+                  previous_signal = signal.iloc[-2]
+
+                  # Son kapanmış 4H mum
+                  current_macd = macd.iloc[-1]
+                  current_signal = signal.iloc[-1]
+
+                  price = float(df["close"].iloc[-1])
+
+                  # ------------------------------------------------
+                  # AL / SAT
+                  # ------------------------------------------------
+
+                  buy = (
+                      previous_macd <= previous_signal
+                      and current_macd > current_signal
+                  )
+
+                  sell = (
+                      previous_macd >= previous_signal
+                      and current_macd < current_signal
+                  )
+
+                  print("Fiyat:", price)
+                  print("MACD:", current_macd)
+                  print("Signal:", current_signal)
+
+                  if buy:
+
+                      action = "AL 🟢"
+
+                  elif sell:
+
+                      action = "SAT 🔴"
+
+                  else:
+
+                      print("Sinyal yok.")
+                      continue
+
+                  # ------------------------------------------------
+                  # TELEGRAM
+                  # ------------------------------------------------
+
+                  message = (
+                      "🚨 MACD 4H ALARM 🚨\n\n"
+                      f"Coin: {SYMBOL}\n"
+                      "Timeframe: 4H\n"
+                      f"Sinyal: {action}\n"
+                      f"Fiyat: {price:.8f}\n"
+                      f"MACD: {current_macd:.8f}\n"
+                      f"Signal: {current_signal:.8f}"
+                  )
+
                   print(message)
-              else:
+
+                  token = os.environ.get(
+                      "TELEGRAM_BOT_TOKEN"
+                  )
+
+                  chat_id = os.environ.get(
+                      "TELEGRAM_CHAT_ID"
+                  )
+
+                  if not token or not chat_id:
+
+                      print(
+                          "Telegram secret bulunamadı."
+                      )
+
+                      continue
 
                   telegram_url = (
-                      "https://api.telegram.org/bot"
-                      f"{token}/sendMessage"
+                      f"https://api.telegram.org/"
+                      f"bot{token}/sendMessage"
                   )
 
                   telegram_response = requests.post(
@@ -155,21 +260,22 @@ jobs:
                   )
 
                   print(
-                      "Telegram HTTP:",
+                      "Telegram:",
                       telegram_response.status_code
                   )
 
+              except Exception as e:
+
                   print(
-                      "Telegram:",
-                      telegram_response.text
+                      f"{SYMBOL} hata verdi: {e}"
                   )
 
-                  if telegram_response.status_code != 200:
-                      raise SystemExit(1)
+                  # Bir coin hata verse bile
+                  # diğer coinler devam etsin.
+                  continue
 
-                  print("Telegram mesajı gönderildi.")
-
-          else:
-              print("Yeni BUY/SELL yok.")
+          print("\n===================================")
+          print("TARAMA TAMAMLANDI")
+          print("===================================")
 
           PY
