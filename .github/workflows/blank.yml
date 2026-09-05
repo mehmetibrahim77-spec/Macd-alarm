@@ -5,9 +5,6 @@ on:
   schedule:
     - cron: "*/15 * * * *"
 
-permissions:
-  contents: read
-
 jobs:
   macd:
     runs-on: ubuntu-latest
@@ -18,7 +15,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Top 100 - 4H MACD
+      - name: TradingView Top 100 - 4H MACD
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -28,179 +25,298 @@ jobs:
 
           python - <<'PY'
           import os
-          import time
           import requests
           import pandas as pd
 
-          BASE = "https://api.bybit.com"
+          TV_URL = "https://scanner.tradingview.com/crypto/scan"
 
           TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
           CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-          session = requests.Session()
-          session.headers.update({
-              "User-Agent": "Mozilla/5.0"
-          })
-
-          def bybit_get(endpoint, params):
-
-              r = session.get(
-                  BASE + endpoint,
-                  params=params,
-                  timeout=20
-              )
-
-              print(
-                  f"{endpoint} -> {r.status_code}"
-              )
-
-              r.raise_for_status()
-
-              data = r.json()
-
-              if data.get("retCode") != 0:
-                  raise RuntimeError(
-                      f"Bybit: {data}"
-                  )
-
-              return data["result"]
-
-          def telegram(message):
-
-              url = (
-                  f"https://api.telegram.org/"
-                  f"bot{TOKEN}/sendMessage"
-              )
-
-              r = session.post(
-                  url,
-                  data={
-                      "chat_id": CHAT_ID,
-                      "text": message
-                  },
-                  timeout=20
-              )
-
-              print(
-                  "Telegram:",
-                  r.status_code
-              )
-
-          # ==========================================
-          # TOP 100 USDT
-          # ==========================================
-
-          result = bybit_get(
-              "/v5/market/tickers",
-              {
-                  "category": "linear"
-              }
-          )
-
-          tickers = result["list"]
-
-          coins = []
-
-          for item in tickers:
-
-              symbol = item.get("symbol", "")
-
-              # Sadece USDT perpetual
-              if not symbol.endswith("USDT"):
-                  continue
-
-              try:
-                  turnover = float(
-                      item["turnover24h"]
-                  )
-              except:
-                  continue
-
-              coins.append(
-                  (symbol, turnover)
-              )
-
-          # 24 saatlik işlem hacmine göre sırala
-          coins.sort(
-              key=lambda x: x[1],
-              reverse=True
-          )
-
-          symbols = [
-              x[0]
-              for x in coins[:100]
+          # TradingView'dan büyük CEX USDT çiftlerini al
+          exchanges = [
+              "BINANCE",
+              "BYBIT",
+              "OKX",
+              "BITGET",
+              "COINBASE"
           ]
+
+          symbols = []
+
+          # ==========================================
+          # TOP 100 KRİPTO
+          # Hacme göre TradingView'dan
+          # ==========================================
+
+          payload = {
+              "filter": [
+                  {
+                      "left": "name",
+                      "operation": "match",
+                      "right": ".*USDT$"
+                  }
+              ],
+              "options": {
+                  "lang": "en"
+              },
+              "markets": [
+                  "crypto"
+              ],
+              "symbols": {
+                  "query": {
+                      "types": []
+                  },
+                  "tickers": []
+              },
+              "columns": [
+                  "name",
+                  "close",
+                  "volume",
+                  "change"
+              ],
+              "sort": {
+                  "sortBy": "volume",
+                  "sortOrder": "desc"
+              },
+              "range": [
+                  0,
+                  300
+              ]
+          }
+
+          r = requests.post(
+              TV_URL,
+              json=payload,
+              timeout=30
+          )
+
+          print("TradingView:", r.status_code)
+
+          r.raise_for_status()
+
+          data = r.json()
+
+          rows = data.get("data", [])
+
+          print(
+              "TradingView sonuç:",
+              len(rows)
+          )
+
+          # Sadece gerçek USDT çiftleri
+          for row in rows:
+
+              ticker = row.get("s", "")
+
+              if not ticker:
+                  continue
+
+              if not ticker.endswith("USDT"):
+                  continue
+
+              # Aynı coin'in farklı borsalardaki
+              # tekrarlarını engelle
+              base = ticker.split(":")[-1]
+
+              if base not in [
+                  x.split(":")[-1]
+                  for x in symbols
+              ]:
+                  symbols.append(ticker)
+
+              if len(symbols) >= 100:
+                  break
 
           print(
               f"TOP 100 bulundu: {len(symbols)}"
           )
 
           # ==========================================
-          # 4H MACD 12 / 26 / 9
+          # MACD
           # ==========================================
 
-          for symbol in symbols:
+          # TradingView scanner'dan doğrudan
+          # 4H MACD değerlerini alacağız.
+          #
+          # MACD.macd|240
+          # MACD.signal|240
+          #
+          # Histogram = MACD - Signal
+          #
+          # Önceki ve mevcut kapanmış mum için
+          # değerleri alıyoruz.
+
+          selected = symbols[:100]
+
+          # TradingView tek istekte çok sayıda sembol
+          # kabul ediyor.
+          payload = {
+              "symbols": {
+                  "tickers": selected,
+                  "query": {
+                      "types": []
+                  }
+              },
+              "columns": [
+                  "name",
+                  "close",
+                  "MACD.macd|240",
+                  "MACD.signal|240",
+                  "MACD.macd[1]|240",
+                  "MACD.signal[1]|240"
+              ]
+          }
+
+          r = requests.post(
+              TV_URL,
+              json=payload,
+              timeout=30
+          )
+
+          print(
+              "MACD TradingView:",
+              r.status_code
+          )
+
+          r.raise_for_status()
+
+          result = r.json()
+
+          macd_rows = result.get(
+              "data",
+              []
+          )
+
+          print(
+              "MACD sonucu:",
+              len(macd_rows)
+          )
+
+          # ==========================================
+          # AL / SAT
+          # ==========================================
+
+          for row in macd_rows:
 
               try:
 
-                  result = bybit_get(
-                      "/v5/market/kline",
-                      {
-                          "category": "linear",
-                          "symbol": symbol,
-                          "interval": "240",
-                          "limit": "100"
-                      }
-                  )
+                  symbol = row["s"]
 
-                  rows = result["list"]
+                  values = row["d"]
 
-                  if len(rows) < 40:
+                  # Alan sırası:
+                  # name
+                  # close
+                  # MACD current
+                  # signal current
+                  # MACD previous
+                  # signal previous
+
+                  price = values[1]
+
+                  macd_current = values[2]
+                  signal_current = values[3]
+
+                  macd_previous = values[4]
+                  signal_previous = values[5]
+
+                  if any(
+                      x is None
+                      for x in [
+                          macd_current,
+                          signal_current,
+                          macd_previous,
+                          signal_previous
+                      ]
+                  ):
                       continue
-
-                  # Bybit en yeni mumu ilk sırada döndürür.
-                  rows = sorted(
-                      rows,
-                      key=lambda x: int(x[0])
-                  )
-
-                  # Son mum açık olabilir.
-                  # Onu tamamen çıkarıyoruz.
-                  closed = rows[:-1]
-
-                  closes = pd.Series([
-                      float(row[4])
-                      for row in closed
-                  ])
-
-                  if len(closes) < 35:
-                      continue
-
-                  # MACD 12 / 26
-                  ema12 = closes.ewm(
-                      span=12,
-                      adjust=False
-                  ).mean()
-
-                  ema26 = closes.ewm(
-                      span=26,
-                      adjust=False
-                  ).mean()
-
-                  macd = ema12 - ema26
-
-                  # Signal 9
-                  signal = macd.ewm(
-                      span=9,
-                      adjust=False
-                  ).mean()
 
                   # Histogram
-                  hist = macd - signal
+                  current_hist = (
+                      macd_current -
+                      signal_current
+                  )
 
-                  # Son 3 KAPANMIŞ mum
-                  h1 = hist.iloc[-3]
-                  h2 = hist.iloc[-2]
-                  h3 = hist.iloc[-1]
+                  previous_hist = (
+                      macd_previous -
+                      signal_previous
+                  )
 
-                  price = closes
+                  # =================================
+                  # 🔴 -> 🟢
+                  # =================================
+
+                  if (
+                      previous_hist <= 0
+                      and current_hist > 0
+                  ):
+
+                      message = (
+                          "🚨 MACD 4H ALARM 🚨\n\n"
+                          f"Coin: {symbol}\n"
+                          "Timeframe: 4H\n"
+                          "Sinyal: AL 🟢\n"
+                          f"Fiyat: {price}\n\n"
+                          f"Histogram: "
+                          f"{previous_hist:.8f} → "
+                          f"{current_hist:.8f}"
+                      )
+
+                      print(message)
+
+                      requests.post(
+                          f"https://api.telegram.org/"
+                          f"bot{TOKEN}/sendMessage",
+                          data={
+                              "chat_id": CHAT_ID,
+                              "text": message
+                          },
+                          timeout=20
+                      )
+
+                  # =================================
+                  # 🟢 -> 🔴
+                  # =================================
+
+                  elif (
+                      previous_hist >= 0
+                      and current_hist < 0
+                  ):
+
+                      message = (
+                          "🚨 MACD 4H ALARM 🚨\n\n"
+                          f"Coin: {symbol}\n"
+                          "Timeframe: 4H\n"
+                          "Sinyal: SAT 🔴\n"
+                          f"Fiyat: {price}\n\n"
+                          f"Histogram: "
+                          f"{previous_hist:.8f} → "
+                          f"{current_hist:.8f}"
+                      )
+
+                      print(message)
+
+                      requests.post(
+                          f"https://api.telegram.org/"
+                          f"bot{TOKEN}/sendMessage",
+                          data={
+                              "chat_id": CHAT_ID,
+                              "text": message
+                          },
+                          timeout=20
+                      )
+
+              except Exception as e:
+
+                  print(
+                      "Coin hata:",
+                      type(e).__name__,
+                      e
+                  )
+
+          print(
+              "✅ TOP 100 4H MACD TARAMASI TAMAMLANDI"
+          )
+
+          PY
