@@ -26,13 +26,11 @@ jobs:
           TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
           CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-          COINGECKO = "https://api.coingecko.com/api/v3/coins/markets"
-          COINEX_MARKETS = "https://api.coinex.com/futures/market"
-          COINEX_KLINE = "https://api.coinex.com/futures/kline"
+          BASE = "https://api.coinex.com/v2"
 
           def get_top_200():
               r = requests.get(
-                  COINGECKO,
+                  "https://api.coingecko.com/api/v3/coins/markets",
                   params={
                       "vs_currency": "usd",
                       "order": "market_cap_desc",
@@ -43,16 +41,11 @@ jobs:
                   timeout=30
               )
               r.raise_for_status()
-
-              return [
-                  x["symbol"].upper()
-                  for x in r.json()
-                  if x.get("symbol")
-              ]
+              return [x["symbol"].upper() for x in r.json()]
 
           def get_markets():
               r = requests.get(
-                  COINEX_MARKETS,
+                  BASE + "/futures/market",
                   timeout=30
               )
               r.raise_for_status()
@@ -74,9 +67,9 @@ jobs:
 
               return markets
 
-          def get_klines(market):
+          def get_candles(market):
               r = requests.get(
-                  COINEX_KLINE,
+                  BASE + "/futures/kline",
                   params={
                       "market": market,
                       "period": "4hour",
@@ -167,12 +160,13 @@ jobs:
           print("MACD 4H TARAMASI BASLIYOR")
 
           coins = get_top_200()
-          markets = get_markets()
-
           print("Top 200:", len(coins))
+
+          markets = get_markets()
           print("CoinEx USDT Futures:", len(markets))
 
           signal_count = 0
+          scanned_count = 0
 
           for coin in coins:
 
@@ -182,12 +176,14 @@ jobs:
                   continue
 
               try:
-                  rows = get_klines(market)
+                  rows = get_candles(market)
 
                   if rows is None:
                       continue
 
                   signal, histogram = calculate_macd(rows)
+
+                  scanned_count += 1
 
                   print(
                       f"{market} | "
@@ -225,6 +221,7 @@ jobs:
 
           print("================================")
           print("TARAMA TAMAMLANDI")
+          print("Taranan:", scanned_count)
           print("Yeni sinyal:", signal_count)
           print("================================")
           PY
