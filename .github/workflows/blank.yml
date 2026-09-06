@@ -26,9 +26,13 @@ jobs:
           TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
           CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-          def top_200():
+          COINGECKO = "https://api.coingecko.com/api/v3/coins/markets"
+          COINEX_MARKETS = "https://api.coinex.com/futures/market"
+          COINEX_KLINE = "https://api.coinex.com/futures/kline"
+
+          def get_top_200():
               r = requests.get(
-                  "https://api.coingecko.com/api/v3/coins/markets",
+                  COINGECKO,
                   params={
                       "vs_currency": "usd",
                       "order": "market_cap_desc",
@@ -39,91 +43,107 @@ jobs:
                   timeout=30
               )
               r.raise_for_status()
-              return [x["symbol"].upper() for x in r.json()]
 
-          def bybit_symbols():
+              return [
+                  x["symbol"].upper()
+                  for x in r.json()
+                  if x.get("symbol")
+              ]
+
+          def get_markets():
               r = requests.get(
-                  "https://api.bybit.com/v5/market/instruments-info",
-                  params={
-                      "category": "linear",
-                      "status": "Trading",
-                      "limit": 1000
-                  },
+                  COINEX_MARKETS,
                   timeout=30
               )
               r.raise_for_status()
+
               data = r.json()
 
-              if data.get("retCode") != 0:
+              if data.get("code") != 0:
                   raise Exception(data)
 
-              return {
-                  x["symbol"]
-                  for x in data["result"]["list"]
-                  if x.get("status") == "Trading"
-                  and x.get("contractType") == "LinearPerpetual"
-                  and x.get("quoteCoin") == "USDT"
-              }
+              markets = set()
 
-          def candles(symbol):
+              for x in data["data"]:
+                  if (
+                      x.get("contract_type") == "linear"
+                      and x.get("quote_ccy") == "USDT"
+                      and x.get("is_market_available") is True
+                  ):
+                      markets.add(x["market"])
+
+              return markets
+
+          def get_klines(market):
               r = requests.get(
-                  "https://api.bybit.com/v5/market/kline",
+                  COINEX_KLINE,
                   params={
-                      "category": "linear",
-                      "symbol": symbol,
-                      "interval": "240",
+                      "market": market,
+                      "period": "4hour",
                       "limit": 100
                   },
                   timeout=30
               )
               r.raise_for_status()
+
               data = r.json()
 
-              if data.get("retCode") != 0:
+              if data.get("code") != 0:
+                  return None
+
+              rows = data["data"]
+
+              if len(rows) < 35:
                   return None
 
               rows = sorted(
-                  data["result"]["list"],
-                  key=lambda x: int(x[0])
+                  rows,
+                  key=lambda x: int(x["created_at"])
               )
 
               now = int(time.time() * 1000)
+
               closed = []
 
               for row in rows:
-                  start = int(row[0])
-                  close = start + 14400000
+                  start = int(row["created_at"])
+                  close = start + 4 * 60 * 60 * 1000
+
                   if close <= now:
                       closed.append(row)
 
-              return closed if len(closed) >= 35 else None
+              if len(closed) < 35:
+                  return None
 
-          def macd(rows):
-              close = pd.Series(
-                  [float(x[4]) for x in rows]
+              return closed
+
+          def calculate_macd(rows):
+              closes = pd.Series(
+                  [float(x["close"]) for x in rows],
+                  dtype="float64"
               )
 
-              ema12 = close.ewm(
+              ema12 = closes.ewm(
                   span=12,
                   adjust=False
               ).mean()
 
-              ema26 = close.ewm(
+              ema26 = closes.ewm(
                   span=26,
                   adjust=False
               ).mean()
 
-              m = ema12 - ema26
+              macd = ema12 - ema26
 
-              s = m.ewm(
+              signal = macd.ewm(
                   span=9,
                   adjust=False
               ).mean()
 
-              h = m - s
+              histogram = macd - signal
 
-              previous = float(h.iloc[-2])
-              current = float(h.iloc[-1])
+              previous = float(histogram.iloc[-2])
+              current = float(histogram.iloc[-1])
 
               if previous <= 0 and current > 0:
                   return "AL", current
@@ -133,7 +153,7 @@ jobs:
 
               return None, current
 
-          def telegram(message):
+          def send_telegram(message):
               r = requests.post(
                   f"https://api.telegram.org/bot{TOKEN}/sendMessage",
                   data={
@@ -144,76 +164,67 @@ jobs:
               )
               r.raise_for_status()
 
-          print("MACD 4H taramasi basliyor...")
+          print("MACD 4H TARAMASI BASLIYOR")
 
-          coins = top_200()
-          symbols = bybit_symbols()
+          coins = get_top_200()
+          markets = get_markets()
 
           print("Top 200:", len(coins))
-          print("Bybit perpetual:", len(symbols))
+          print("CoinEx USDT Futures:", len(markets))
 
-          signals = []
+          signal_count = 0
 
           for coin in coins:
-              symbol = coin + "USDT"
 
-              if symbol not in symbols:
+              market = coin + "USDT"
+
+              if market not in markets:
                   continue
 
               try:
-                  rows = candles(symbol)
+                  rows = get_klines(market)
 
                   if rows is None:
                       continue
 
-                  signal, histogram = macd(rows)
+                  signal, histogram = calculate_macd(rows)
 
                   print(
-                      symbol,
-                      "Histogram:",
-                      round(histogram, 8),
-                      "Sinyal:",
-                      signal
+                      f"{market} | "
+                      f"Histogram: {histogram:.8f} | "
+                      f"Sinyal: {signal}"
                   )
 
-                  if signal:
-                      price = float(rows[-1][4])
-                      signals.append(
-                          (
-                              symbol,
-                              signal,
-                              price,
-                              histogram
-                          )
-                      )
+                  if signal is None:
+                      continue
+
+                  price = float(rows[-1]["close"])
+
+                  emoji = "🟢" if signal == "AL" else "🔴"
+
+                  message = (
+                      "🚨 MACD 4H ALARM 🚨\n\n"
+                      f"Coin: {market}\n"
+                      "Timeframe: 4H\n"
+                      f"Sinyal: {signal} {emoji}\n"
+                      f"Fiyat: {price}\n"
+                      f"MACD Histogram: {histogram:.8f}\n\n"
+                      "CoinEx Linear Futures"
+                  )
+
+                  send_telegram(message)
+
+                  print(
+                      f"TELEGRAM GONDERILDI: {market} {signal}"
+                  )
+
+                  signal_count += 1
 
               except Exception as e:
-                  print(symbol, "HATA:", e)
+                  print(f"{market} HATA: {e}")
 
-          for symbol, signal, price, histogram in signals:
-
-              emoji = "🟢" if signal == "AL" else "🔴"
-
-              message = (
-                  "🚨 MACD 4H ALARM 🚨\n\n"
-                  f"Coin: {symbol}\n"
-                  "Timeframe: 4H\n"
-                  f"Sinyal: {signal} {emoji}\n"
-                  f"Fiyat: {price}\n"
-                  f"MACD Histogram: {histogram:.8f}\n\n"
-                  "Bybit Linear Futures"
-              )
-
-              telegram(message)
-
-              print(
-                  "TELEGRAM GONDERILDI:",
-                  symbol,
-                  signal
-              )
-
-          print(
-              "Tarama tamamlandi. Yeni sinyal:",
-              len(signals)
-          )
+          print("================================")
+          print("TARAMA TAMAMLANDI")
+          print("Yeni sinyal:", signal_count)
+          print("================================")
           PY
