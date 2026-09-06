@@ -15,7 +15,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: MACD Top 200
+      - name: MACD Top 200 - 4H
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -33,43 +33,30 @@ jobs:
           s = requests.Session()
           s.headers.update({"User-Agent": "Mozilla/5.0"})
 
-          def telegram(text):
-              r = s.post(
-                  f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-                  data={
-                      "chat_id": CHAT_ID,
-                      "text": text
-                  },
-                  timeout=20
-              )
-
-              print("TELEGRAM:", r.status_code)
-              print(r.text)
-
-              r.raise_for_status()
-
-              if not r.json().get("ok"):
-                  raise RuntimeError(r.text)
-
           def get(url, params):
               r = s.get(url, params=params, timeout=20)
               r.raise_for_status()
               return r.json()
 
+          def telegram(text):
+              r = s.post(
+                  f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                  data={"chat_id": CHAT_ID, "text": text},
+                  timeout=20
+              )
+              print("TELEGRAM:", r.status_code, r.text)
+              r.raise_for_status()
+              if not r.json().get("ok"):
+                  raise RuntimeError(r.text)
+
           def binance(symbol):
               try:
                   data = get(
                       "https://api.binance.com/api/v3/klines",
-                      {
-                          "symbol": symbol,
-                          "interval": "4h",
-                          "limit": 100
-                      }
+                      {"symbol": symbol, "interval": "4h", "limit": 100}
                   )
-
                   if len(data) < 40:
                       return None
-
                   return [float(x[4]) for x in data[:-1]]
               except:
                   return None
@@ -85,17 +72,12 @@ jobs:
                           "limit": 100
                       }
                   )
-
                   if data.get("retCode") != 0:
                       return None
-
                   rows = data["result"]["list"]
-
                   if len(rows) < 40:
                       return None
-
                   rows.sort(key=lambda x: int(x[0]))
-
                   return [float(x[4]) for x in rows[:-1]]
               except:
                   return None
@@ -103,7 +85,6 @@ jobs:
           def okx(symbol):
               try:
                   base = symbol[:-4]
-
                   data = get(
                       "https://www.okx.com/api/v5/market/candles",
                       {
@@ -112,17 +93,12 @@ jobs:
                           "limit": "100"
                       }
                   )
-
                   if data.get("code") != "0":
                       return None
-
                   rows = data.get("data", [])
-
                   if len(rows) < 40:
                       return None
-
                   rows.sort(key=lambda x: int(x[0]))
-
                   return [float(x[4]) for x in rows[:-1]]
               except:
                   return None
@@ -130,7 +106,6 @@ jobs:
           def gate(symbol):
               try:
                   base = symbol[:-4]
-
                   data = get(
                       "https://api.gateio.ws/api/v4/futures/usdt/candlesticks",
                       {
@@ -139,12 +114,9 @@ jobs:
                           "limit": 100
                       }
                   )
-
                   if len(data) < 40:
                       return None
-
                   data.sort(key=lambda x: int(x["t"]))
-
                   return [float(x["c"]) for x in data[:-1]]
               except:
                   return None
@@ -157,15 +129,9 @@ jobs:
                   ("GATE", gate)
               ]:
                   p = func(symbol)
-
                   if p:
                       return name, p
-
               return None, None
-
-          # ==================================================
-          # COINGECKO TOP 200
-          # ==================================================
 
           coins = get(
               "https://api.coingecko.com/api/v3/coins/markets",
@@ -178,9 +144,9 @@ jobs:
               }
           )
 
-          print("========================================")
+          print("=" * 50)
           print("COINGECKO MARKET CAP TOP 200")
-          print("========================================")
+          print("=" * 50)
           print("Coin sayısı:", len(coins))
 
           if len(coins) != 200:
@@ -192,7 +158,6 @@ jobs:
           available = 0
 
           for i, coin in enumerate(coins, 1):
-
               name = coin.get("name", "")
               symbol = coin.get("symbol", "").upper()
 
@@ -200,5 +165,94 @@ jobs:
                   continue
 
               if symbol in {
-                  "USDT",
-                  "USDC
+                  "USDT", "USDC", "DAI", "USDE",
+                  "USD1", "USDS", "FDUSD"
+              }:
+                  continue
+
+              pair = symbol + "USDT"
+
+              print(
+                  f"[{i}/200] #{coin.get('market_cap_rank')} "
+                  f"{name} -> {pair}"
+              )
+
+              source, p = prices(pair)
+
+              if not p:
+                  print("  4H veri yok")
+                  continue
+
+              available += 1
+
+              close = pd.Series(p)
+
+              ema12 = close.ewm(
+                  span=12,
+                  adjust=False
+              ).mean()
+
+              ema26 = close.ewm(
+                  span=26,
+                  adjust=False
+              ).mean()
+
+              macd = ema12 - ema26
+
+              signal = macd.ewm(
+                  span=9,
+                  adjust=False
+              ).mean()
+
+              hist = macd - signal
+
+              previous_hist = hist.iloc[-2]
+              current_hist = hist.iloc[-1]
+
+              side = None
+
+              if previous_hist <= 0 and current_hist > 0:
+                  side = "AL 🟢"
+
+              elif previous_hist >= 0 and current_hist < 0:
+                  side = "SAT 🔴"
+
+              if side:
+                  print("!!! SİNYAL:", name, side)
+
+                  signals.append({
+                      "name": name,
+                      "symbol": pair,
+                      "source": source,
+                      "side": side,
+                      "price": p[-1],
+                      "macd": macd.iloc[-1],
+                      "signal": signal.iloc[-1]
+                  })
+
+          print("=" * 50)
+          print("TARAMA TAMAMLANDI")
+          print("Top 200:", len(coins))
+          print("4H verisi bulunan:", available)
+          print("Yeni MACD sinyali:", len(signals))
+          print("=" * 50)
+
+          for x in signals:
+              message = (
+                  "🚨 MACD 4H ALARM 🚨\n\n"
+                  f"Coin: {x['name']}\n"
+                  f"Sembol: {x['symbol']}\n"
+                  f"Timeframe: 4H\n"
+                  f"Sinyal: {x['side']}\n"
+                  f"Fiyat: {x['price']}\n"
+                  f"MACD: {x['macd']:.8f}\n"
+                  f"Signal: {x['signal']:.8f}\n"
+                  f"Kaynak: {x['source']}"
+              )
+
+              telegram(message)
+
+              print("TELEGRAM GÖNDERİLDİ:", x["symbol"])
+
+          print("Tarama başarıyla tamamlandı.")
+          PY
