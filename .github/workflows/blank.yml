@@ -5,6 +5,9 @@ on:
   schedule:
     - cron: "*/15 * * * *"
 
+permissions:
+  contents: read
+
 jobs:
   macd:
     runs-on: ubuntu-latest
@@ -15,7 +18,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: MACD Top 200 - 4H
+      - name: Top 200 - 4H MACD
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -27,219 +30,223 @@ jobs:
           import requests
           import pandas as pd
 
+          BASE = "https://api.bybit.com"
+
           TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
           CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
           session = requests.Session()
-          session.headers.update({"User-Agent": "Mozilla/5.0"})
+          session.headers.update({
+              "User-Agent": "Mozilla/5.0"
+          })
 
-          def get(url, params=None):
-              r = session.get(url, params=params, timeout=20)
+          def bybit_get(endpoint, params):
+              r = session.get(
+                  BASE + endpoint,
+                  params=params,
+                  timeout=20
+              )
+              print(f"{endpoint} -> {r.status_code}")
               r.raise_for_status()
-              return r.json()
 
-          def telegram(text):
+              data = r.json()
+
+              if data.get("retCode") != 0:
+                  raise RuntimeError(f"Bybit: {data}")
+
+              return data["result"]
+
+          def telegram(message):
+              url = (
+                  f"https://api.telegram.org/"
+                  f"bot{TOKEN}/sendMessage"
+              )
+
               r = session.post(
-                  f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                  url,
                   data={
                       "chat_id": CHAT_ID,
-                      "text": text
+                      "text": message
                   },
                   timeout=20
               )
-              print("TELEGRAM:", r.status_code, r.text)
-              r.raise_for_status()
 
-              if not r.json().get("ok"):
-                  raise RuntimeError(r.text)
+              print("Telegram:", r.status_code)
 
-          def binance(symbol):
+          # ==========================================
+          # TOP 200 USDT PERPETUAL
+          # ==========================================
+
+          result = bybit_get(
+              "/v5/market/tickers",
+              {
+                  "category": "linear"
+              }
+          )
+
+          tickers = result["list"]
+
+          coins = []
+
+          for item in tickers:
+              symbol = item.get("symbol", "")
+
+              if not symbol.endswith("USDT"):
+                  continue
+
+              # Sadece perpetual kontratlar
+              if item.get("contractType") != "LinearPerpetual":
+                  continue
+
               try:
-                  data = get(
-                      "https://api.binance.com/api/v3/klines",
-                      {
-                          "symbol": symbol,
-                          "interval": "4h",
-                          "limit": 100
-                      }
-                  )
+                  turnover = float(item["turnover24h"])
+              except:
+                  continue
 
-                  if len(data) < 40:
-                      return None
+              coins.append((symbol, turnover))
 
-                  return [float(x[4]) for x in data[:-1]]
-              except Exception:
-                  return None
+          # 24 saatlik işlem hacmine göre sırala
+          coins.sort(
+              key=lambda x: x[1],
+              reverse=True
+          )
 
-          def bybit(symbol):
+          symbols = [
+              x[0]
+              for x in coins[:200]
+          ]
+
+          print(
+              f"TOP 200 bulundu: {len(symbols)}"
+          )
+
+          # ==========================================
+          # 4H MACD 12 / 26 / 9
+          # ==========================================
+
+          for symbol in symbols:
+
               try:
-                  data = get(
-                      "https://api.bybit.com/v5/market/kline",
+
+                  result = bybit_get(
+                      "/v5/market/kline",
                       {
                           "category": "linear",
                           "symbol": symbol,
                           "interval": "240",
-                          "limit": 100
-                      }
-                  )
-
-                  if data.get("retCode") != 0:
-                      return None
-
-                  rows = data["result"]["list"]
-
-                  if len(rows) < 40:
-                      return None
-
-                  rows.sort(key=lambda x: int(x[0]))
-
-                  return [float(x[4]) for x in rows[:-1]]
-              except Exception:
-                  return None
-
-          def okx(symbol):
-              try:
-                  base = symbol[:-4]
-
-                  data = get(
-                      "https://www.okx.com/api/v5/market/candles",
-                      {
-                          "instId": f"{base}-USDT-SWAP",
-                          "bar": "4H",
                           "limit": "100"
                       }
                   )
 
-                  if data.get("code") != "0":
-                      return None
-
-                  rows = data.get("data", [])
+                  rows = result["list"]
 
                   if len(rows) < 40:
-                      return None
+                      continue
 
-                  rows.sort(key=lambda x: int(x[0]))
-
-                  return [float(x[4]) for x in rows[:-1]]
-              except Exception:
-                  return None
-
-          def gate(symbol):
-              try:
-                  base = symbol[:-4]
-
-                  data = get(
-                      "https://api.gateio.ws/api/v4/futures/usdt/candlesticks",
-                      {
-                          "contract": f"{base}_USDT",
-                          "interval": "4h",
-                          "limit": 100
-                      }
+                  # En yeni mum ilk sırada gelir
+                  rows = sorted(
+                      rows,
+                      key=lambda x: int(x[0])
                   )
 
-                  if len(data) < 40:
-                      return None
+                  # Açık 4H mumunu kullanma
+                  closed = rows[:-1]
 
-                  data.sort(key=lambda x: int(x["t"]))
+                  closes = pd.Series([
+                      float(row[4])
+                      for row in closed
+                  ])
 
-                  return [float(x["c"]) for x in data[:-1]]
-              except Exception:
-                  return None
+                  if len(closes) < 35:
+                      continue
 
-          def get_prices(symbol):
-              for source, function in [
-                  ("BINANCE", binance),
-                  ("BYBIT", bybit),
-                  ("OKX", okx),
-                  ("GATE", gate)
-              ]:
-                  prices = function(symbol)
+                  # ==========================
+                  # MACD 12 / 26 / 9
+                  # ==========================
 
-                  if prices:
-                      return source, prices
+                  ema12 = closes.ewm(
+                      span=12,
+                      adjust=False
+                  ).mean()
 
-              return None, None
+                  ema26 = closes.ewm(
+                      span=26,
+                      adjust=False
+                  ).mean()
 
-          coins = get(
-              "https://api.coingecko.com/api/v3/coins/markets",
-              {
-                  "vs_currency": "usd",
-                  "order": "market_cap_desc",
-                  "per_page": 200,
-                  "page": 1,
-                  "sparkline": "false"
-              }
-          )
+                  macd = ema12 - ema26
 
-          print("=" * 60)
-          print("COINGECKO MARKET CAP TOP 200")
-          print("=" * 60)
-          print("Top 200 coin sayısı:", len(coins))
+                  signal = macd.ewm(
+                      span=9,
+                      adjust=False
+                  ).mean()
 
-          if len(coins) != 200:
-              raise RuntimeError(
-                  f"CoinGecko Top 200 alınamadı. Gelen: {len(coins)}"
-              )
+                  histogram = macd - signal
 
-          signals = []
-          available = 0
+                  # Son iki kapanmış mum
+                  previous_hist = histogram.iloc[-2]
+                  current_hist = histogram.iloc[-1]
 
-          stablecoins = {
-              "USDT",
-              "USDC",
-              "DAI",
-              "USDE",
-              "USD1",
-              "USDS",
-              "FDUSD"
-          }
+                  price = float(closes.iloc[-1])
 
-          for i, coin in enumerate(coins, 1):
+                  # =================================
+                  # KIRMIZIDAN YEŞİLE -> AL
+                  # =================================
 
-              name = coin.get("name", "")
-              symbol = coin.get("symbol", "").upper()
+                  buy_signal = (
+                      previous_hist <= 0
+                      and current_hist > 0
+                  )
 
-              if not symbol or symbol in stablecoins:
-                  continue
+                  # =================================
+                  # YEŞİLDEN KIRMIZIYA -> SAT
+                  # =================================
 
-              pair = symbol + "USDT"
+                  sell_signal = (
+                      previous_hist >= 0
+                      and current_hist < 0
+                  )
 
-              print(
-                  f"[{i}/200] "
-                  f"#{coin.get('market_cap_rank')} "
-                  f"{name} -> {pair}"
-              )
+                  if buy_signal:
 
-              source, prices = get_prices(pair)
+                      message = (
+                          "🚨 MACD 4H ALARM 🚨\n\n"
+                          f"Coin: {symbol}\n"
+                          "Timeframe: 4H\n"
+                          "Sinyal: AL 🟢\n"
+                          f"Fiyat: {price}\n\n"
+                          "MACD kırmızıdan yeşile döndü."
+                      )
 
-              if not prices:
-                  print("  4H veri yok")
-                  continue
+                      telegram(message)
 
-              available += 1
+                      print(message)
 
-              close = pd.Series(prices)
+                  elif sell_signal:
 
-              ema12 = close.ewm(
-                  span=12,
-                  adjust=False
-              ).mean()
+                      message = (
+                          "🚨 MACD 4H ALARM 🚨\n\n"
+                          f"Coin: {symbol}\n"
+                          "Timeframe: 4H\n"
+                          "Sinyal: SAT 🔴\n"
+                          f"Fiyat: {price}\n\n"
+                          "MACD yeşilden kırmızıya döndü."
+                      )
 
-              ema26 = close.ewm(
-                  span=26,
-                  adjust=False
-              ).mean()
+                      telegram(message)
 
-              macd = ema12 - ema26
+                      print(message)
 
-              signal = macd.ewm(
-                  span=9,
-                  adjust=False
-              ).mean()
+                  else:
+                      print(
+                          f"{symbol}: Sinyal yok"
+                      )
 
-              histogram = macd - signal
+              except Exception as e:
 
-              previous_hist = histogram.iloc[-2]
-              current_hist = histogram.iloc[-1]
+                  print(
+                      f"{symbol}: HATA -> {e}"
+                  )
 
-              side
+          print("Tarama tamamlandı.")
+          PY
