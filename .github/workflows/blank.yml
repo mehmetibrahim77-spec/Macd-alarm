@@ -18,7 +18,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Top 200 - 4H MACD
+      - name: MACD Top 200 - 4H
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -29,38 +29,26 @@ jobs:
           import os
           import requests
           import pandas as pd
+          import time
 
-          BASE = "https://api.bybit.com"
+          BYBIT = "https://api.bybit.com"
+          CMC = "https://pro-api.coinmarketcap.com/public-api"
 
           TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
           CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
           session = requests.Session()
           session.headers.update({
-              "User-Agent": "Mozilla/5.0"
+              "User-Agent": "MACD-Alarm/1.0",
+              "Accept": "application/json"
           })
 
-          def bybit_get(endpoint, params):
-              r = session.get(
-                  BASE + endpoint,
-                  params=params,
-                  timeout=20
-              )
-              print(f"{endpoint} -> {r.status_code}")
-              r.raise_for_status()
+          # ============================================================
+          # TELEGRAM
+          # ============================================================
 
-              data = r.json()
-
-              if data.get("retCode") != 0:
-                  raise RuntimeError(f"Bybit: {data}")
-
-              return data["result"]
-
-          def telegram(message):
-              url = (
-                  f"https://api.telegram.org/"
-                  f"bot{TOKEN}/sendMessage"
-              )
+          def send_telegram(message):
+              url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
 
               r = session.post(
                   url,
@@ -71,182 +59,214 @@ jobs:
                   timeout=20
               )
 
-              print("Telegram:", r.status_code)
+              r.raise_for_status()
 
-          # ==========================================
-          # TOP 200 USDT PERPETUAL
-          # ==========================================
+          # ============================================================
+          # CMC TOP 200 MARKET CAP
+          # ============================================================
 
-          result = bybit_get(
-              "/v5/market/tickers",
-              {
-                  "category": "linear"
+          def get_cmc_top_200():
+              url = f"{CMC}/v1/cryptocurrency/listings/latest"
+
+              params = {
+                  "start": 1,
+                  "limit": 200,
+                  "convert": "USD",
+                  "sort": "market_cap"
               }
-          )
 
-          tickers = result["list"]
+              r = session.get(
+                  url,
+                  params=params,
+                  timeout=30
+              )
 
-          coins = []
+              r.raise_for_status()
 
-          for item in tickers:
-              symbol = item.get("symbol", "")
+              data = r.json()
 
-              if not symbol.endswith("USDT"):
-                  continue
+              if "data" not in data:
+                  raise RuntimeError(
+                      f"CMC cevap hatası: {data}"
+                  )
 
-              # Sadece perpetual kontratlar
-              if item.get("contractType") != "LinearPerpetual":
-                  continue
+              return data["data"]
 
-              try:
-                  turnover = float(item["turnover24h"])
-              except:
-                  continue
+          # ============================================================
+          # BYBIT LINEAR CONTRACTS
+          # ============================================================
 
-              coins.append((symbol, turnover))
+          def get_bybit_symbols():
+              url = f"{BYBIT}/v5/market/instruments-info"
 
-          # 24 saatlik işlem hacmine göre sırala
-          coins.sort(
-              key=lambda x: x[1],
-              reverse=True
-          )
+              cursor = None
+              symbols = {}
 
-          symbols = [
-              x[0]
-              for x in coins[:200]
-          ]
+              while True:
+
+                  params = {
+                      "category": "linear",
+                      "limit": 1000
+                  }
+
+                  if cursor:
+                      params["cursor"] = cursor
+
+                  r = session.get(
+                      url,
+                      params=params,
+                      timeout=30
+                  )
+
+                  r.raise_for_status()
+
+                  data = r.json()
+
+                  if data.get("retCode") != 0:
+                      raise RuntimeError(
+                          f"Bybit instruments hatası: {data}"
+                      )
+
+                  result = data["result"]
+
+                  for item in result.get("list", []):
+
+                      symbol = item.get("symbol", "")
+                      status = item.get("status", "")
+                      contract_type = item.get("contractType", "")
+
+                      if (
+                          symbol.endswith("USDT")
+                          and status == "Trading"
+                          and contract_type == "LinearPerpetual"
+                      ):
+                          base_coin = item.get(
+                              "baseCoin",
+                              ""
+                          ).upper()
+
+                          if base_coin:
+                              symbols[base_coin] = symbol
+
+                  cursor = result.get("nextPageCursor")
+
+                  if not cursor:
+                      break
+
+              return symbols
+
+          # ============================================================
+          # BYBIT 4H KLINES
+          # ============================================================
+
+          def get_klines(symbol):
+
+              url = f"{BYBIT}/v5/market/kline"
+
+              params = {
+                  "category": "linear",
+                  "symbol": symbol,
+                  "interval": "240",
+                  "limit": 100
+              }
+
+              r = session.get(
+                  url,
+                  params=params,
+                  timeout=20
+              )
+
+              r.raise_for_status()
+
+              data = r.json()
+
+              if data.get("retCode") != 0:
+                  raise RuntimeError(
+                      f"Kline hatası: {data}"
+                  )
+
+              rows = data["result"]["list"]
+
+              if len(rows) < 40:
+                  return None
+
+              # Bybit en yeni mumu ilk sırada verir.
+              rows = sorted(
+                  rows,
+                  key=lambda x: int(x[0])
+              )
+
+              # Son mum açık olabilir.
+              # Açık 4H mumu kesinlikle kullanma.
+              rows = rows[:-1]
+
+              closes = [
+                  float(row[4])
+                  for row in rows
+              ]
+
+              return closes
+
+          # ============================================================
+          # MACD 12 / 26 / 9
+          # ============================================================
+
+          def check_macd(closes):
+
+              if len(closes) < 35:
+                  return None
+
+              close = pd.Series(closes)
+
+              ema12 = close.ewm(
+                  span=12,
+                  adjust=False
+              ).mean()
+
+              ema26 = close.ewm(
+                  span=26,
+                  adjust=False
+              ).mean()
+
+              macd = ema12 - ema26
+
+              signal = macd.ewm(
+                  span=9,
+                  adjust=False
+              ).mean()
+
+              # Son iki KAPANMIŞ 4H mum
+              prev_macd = float(macd.iloc[-2])
+              prev_signal = float(signal.iloc[-2])
+
+              curr_macd = float(macd.iloc[-1])
+              curr_signal = float(signal.iloc[-1])
+
+              price = float(close.iloc[-1])
+
+              # MACD signal çizgisini aşağıdan yukarı kesiyor
+              if (
+                  prev_macd <= prev_signal
+                  and curr_macd > curr_signal
+              ):
+                  return "AL", price
+
+              # MACD signal çizgisini yukarıdan aşağı kesiyor
+              if (
+                  prev_macd >= prev_signal
+                  and curr_macd < curr_signal
+              ):
+                  return "SAT", price
+
+              return None
+
+          # ============================================================
+          # ANA TARAMA
+          # ============================================================
+
+          print("CMC Top 200 market-cap listesi alınıyor...")
+
+          cmc_coins = get_cmc_top_200()
 
           print(
-              f"TOP 200 bulundu: {len(symbols)}"
-          )
-
-          # ==========================================
-          # 4H MACD 12 / 26 / 9
-          # ==========================================
-
-          for symbol in symbols:
-
-              try:
-
-                  result = bybit_get(
-                      "/v5/market/kline",
-                      {
-                          "category": "linear",
-                          "symbol": symbol,
-                          "interval": "240",
-                          "limit": "100"
-                      }
-                  )
-
-                  rows = result["list"]
-
-                  if len(rows) < 40:
-                      continue
-
-                  # En yeni mum ilk sırada gelir
-                  rows = sorted(
-                      rows,
-                      key=lambda x: int(x[0])
-                  )
-
-                  # Açık 4H mumunu kullanma
-                  closed = rows[:-1]
-
-                  closes = pd.Series([
-                      float(row[4])
-                      for row in closed
-                  ])
-
-                  if len(closes) < 35:
-                      continue
-
-                  # ==========================
-                  # MACD 12 / 26 / 9
-                  # ==========================
-
-                  ema12 = closes.ewm(
-                      span=12,
-                      adjust=False
-                  ).mean()
-
-                  ema26 = closes.ewm(
-                      span=26,
-                      adjust=False
-                  ).mean()
-
-                  macd = ema12 - ema26
-
-                  signal = macd.ewm(
-                      span=9,
-                      adjust=False
-                  ).mean()
-
-                  histogram = macd - signal
-
-                  # Son iki kapanmış mum
-                  previous_hist = histogram.iloc[-2]
-                  current_hist = histogram.iloc[-1]
-
-                  price = float(closes.iloc[-1])
-
-                  # =================================
-                  # KIRMIZIDAN YEŞİLE -> AL
-                  # =================================
-
-                  buy_signal = (
-                      previous_hist <= 0
-                      and current_hist > 0
-                  )
-
-                  # =================================
-                  # YEŞİLDEN KIRMIZIYA -> SAT
-                  # =================================
-
-                  sell_signal = (
-                      previous_hist >= 0
-                      and current_hist < 0
-                  )
-
-                  if buy_signal:
-
-                      message = (
-                          "🚨 MACD 4H ALARM 🚨\n\n"
-                          f"Coin: {symbol}\n"
-                          "Timeframe: 4H\n"
-                          "Sinyal: AL 🟢\n"
-                          f"Fiyat: {price}\n\n"
-                          "MACD kırmızıdan yeşile döndü."
-                      )
-
-                      telegram(message)
-
-                      print(message)
-
-                  elif sell_signal:
-
-                      message = (
-                          "🚨 MACD 4H ALARM 🚨\n\n"
-                          f"Coin: {symbol}\n"
-                          "Timeframe: 4H\n"
-                          "Sinyal: SAT 🔴\n"
-                          f"Fiyat: {price}\n\n"
-                          "MACD yeşilden kırmızıya döndü."
-                      )
-
-                      telegram(message)
-
-                      print(message)
-
-                  else:
-                      print(
-                          f"{symbol}: Sinyal yok"
-                      )
-
-              except Exception as e:
-
-                  print(
-                      f"{symbol}: HATA -> {e}"
-                  )
-
-          print("Tarama tamamlandı.")
-          PY
+              f"CMC'den {len(cmc_co
