@@ -1,210 +1,219 @@
-steps:
-  - name: MACD Scanner
-    env:
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-    run: |
-      python - <<'PY'
-      import requests
-      import time
-      import pandas as pd
+name: MACD Alarm
 
-      TELEGRAM_BOT_TOKEN = __import__("os").environ["TELEGRAM_BOT_TOKEN"]
-      TELEGRAM_CHAT_ID = __import__("os").environ["TELEGRAM_CHAT_ID"]
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "5 */4 * * *"
 
-      COINGECKO_URL = "https://api.coingecko.com/api/v3/coins/markets"
-      BYBIT_INSTRUMENTS = "https://api.bybit.com/v5/market/instruments-info"
-      BYBIT_KLINE = "https://api.bybit.com/v5/market/kline"
+jobs:
+  macd:
+    runs-on: ubuntu-latest
 
-      def get_top_200():
-          params = {
-              "vs_currency": "usd",
-              "order": "market_cap_desc",
-              "per_page": 200,
-              "page": 1,
-              "sparkline": "false"
-          }
+    steps:
+      - name: MACD Scanner
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python -m pip install requests pandas
 
-          r = requests.get(COINGECKO_URL, params=params, timeout=20)
-          r.raise_for_status()
+          python - <<'PY'
+          import os
+          import time
+          import requests
+          import pandas as pd
 
-          data = r.json()
+          TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+          CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-          return [
-              x["symbol"].upper()
-              for x in data
-              if x.get("symbol")
-          ]
+          def top_200():
+              r = requests.get(
+                  "https://api.coingecko.com/api/v3/coins/markets",
+                  params={
+                      "vs_currency": "usd",
+                      "order": "market_cap_desc",
+                      "per_page": 200,
+                      "page": 1,
+                      "sparkline": "false"
+                  },
+                  timeout=30
+              )
+              r.raise_for_status()
+              return [x["symbol"].upper() for x in r.json()]
 
-      def get_bybit_symbols():
-          params = {
-              "category": "linear",
-              "status": "Trading",
-              "limit": 1000
-          }
+          def bybit_symbols():
+              r = requests.get(
+                  "https://api.bybit.com/v5/market/instruments-info",
+                  params={
+                      "category": "linear",
+                      "status": "Trading",
+                      "limit": 1000
+                  },
+                  timeout=30
+              )
+              r.raise_for_status()
+              data = r.json()
 
-          r = requests.get(BYBIT_INSTRUMENTS, params=params, timeout=20)
-          r.raise_for_status()
+              if data.get("retCode") != 0:
+                  raise Exception(data)
 
-          data = r.json()
+              return {
+                  x["symbol"]
+                  for x in data["result"]["list"]
+                  if x.get("status") == "Trading"
+                  and x.get("contractType") == "LinearPerpetual"
+                  and x.get("quoteCoin") == "USDT"
+              }
 
-          if data.get("retCode") != 0:
-              raise RuntimeError(data)
+          def candles(symbol):
+              r = requests.get(
+                  "https://api.bybit.com/v5/market/kline",
+                  params={
+                      "category": "linear",
+                      "symbol": symbol,
+                      "interval": "240",
+                      "limit": 100
+                  },
+                  timeout=30
+              )
+              r.raise_for_status()
+              data = r.json()
 
-          symbols = set()
+              if data.get("retCode") != 0:
+                  return None
 
-          for item in data["result"]["list"]:
-              if (
-                  item.get("status") == "Trading"
-                  and item.get("contractType") == "LinearPerpetual"
-                  and item.get("quoteCoin") == "USDT"
-              ):
-                  symbols.add(item["symbol"])
-
-          return symbols
-
-      def get_klines(symbol):
-          params = {
-              "category": "linear",
-              "symbol": symbol,
-              "interval": "240",
-              "limit": 100
-          }
-
-          r = requests.get(BYBIT_KLINE, params=params, timeout=20)
-          r.raise_for_status()
-
-          data = r.json()
-
-          if data.get("retCode") != 0:
-              return None
-
-          rows = data["result"]["list"]
-
-          if len(rows) < 35:
-              return None
-
-          # Bybit newest -> oldest döndürür.
-          rows = sorted(rows, key=lambda x: int(x[0]))
-
-          # Son mum açık olabilir. MACD'yi sadece kapanmış mumlarla hesapla.
-          now_ms = int(time.time() * 1000)
-
-          closed = []
-          for row in rows:
-              start_ms = int(row[0])
-              close_ms = start_ms + (4 * 60 * 60 * 1000)
-
-              if close_ms <= now_ms:
-                  closed.append(row)
-
-          if len(closed) < 35:
-              return None
-
-          return closed
-
-      def calculate_signal(rows):
-          closes = pd.Series(
-              [float(row[4]) for row in rows],
-              dtype="float64"
-          )
-
-          ema12 = closes.ewm(span=12, adjust=False).mean()
-          ema26 = closes.ewm(span=26, adjust=False).mean()
-
-          macd = ema12 - ema26
-          signal = macd.ewm(span=9, adjust=False).mean()
-          histogram = macd - signal
-
-          previous = float(histogram.iloc[-2])
-          current = float(histogram.iloc[-1])
-
-          if previous <= 0 and current > 0:
-              return "AL", current
-
-          if previous >= 0 and current < 0:
-              return "SAT", current
-
-          return None, current
-
-      def send_telegram(message):
-          url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-
-          r = requests.post(
-              url,
-              data={
-                  "chat_id": TELEGRAM_CHAT_ID,
-                  "text": message
-              },
-              timeout=20
-          )
-
-          r.raise_for_status()
-
-      print("Top 200 coin listesi aliniyor...")
-      top_200 = get_top_200()
-      print(f"Top 200 alindi: {len(top_200)} coin")
-
-      print("Bybit USDT perpetual sembolleri aliniyor...")
-      bybit_symbols = get_bybit_symbols()
-      print(f"Bybit sembol sayisi: {len(bybit_symbols)}")
-
-      signals = []
-
-      for coin in top_200:
-          symbol = coin + "USDT"
-
-          if symbol not in bybit_symbols:
-              continue
-
-          try:
-              rows = get_klines(symbol)
-
-              if rows is None:
-                  continue
-
-              signal, histogram = calculate_signal(rows)
-
-              print(
-                  f"{symbol}: histogram={histogram:.8f} signal={signal}"
+              rows = sorted(
+                  data["result"]["list"],
+                  key=lambda x: int(x[0])
               )
 
-              if signal:
-                  price = float(rows[-1][4])
+              now = int(time.time() * 1000)
+              closed = []
 
-                  signals.append(
-                      {
-                          "symbol": symbol,
-                          "signal": signal,
-                          "price": price,
-                          "histogram": histogram
-                      }
+              for row in rows:
+                  start = int(row[0])
+                  close = start + 14400000
+                  if close <= now:
+                      closed.append(row)
+
+              return closed if len(closed) >= 35 else None
+
+          def macd(rows):
+              close = pd.Series(
+                  [float(x[4]) for x in rows]
+              )
+
+              ema12 = close.ewm(
+                  span=12,
+                  adjust=False
+              ).mean()
+
+              ema26 = close.ewm(
+                  span=26,
+                  adjust=False
+              ).mean()
+
+              m = ema12 - ema26
+
+              s = m.ewm(
+                  span=9,
+                  adjust=False
+              ).mean()
+
+              h = m - s
+
+              previous = float(h.iloc[-2])
+              current = float(h.iloc[-1])
+
+              if previous <= 0 and current > 0:
+                  return "AL", current
+
+              if previous >= 0 and current < 0:
+                  return "SAT", current
+
+              return None, current
+
+          def telegram(message):
+              r = requests.post(
+                  f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                  data={
+                      "chat_id": CHAT_ID,
+                      "text": message
+                  },
+                  timeout=30
+              )
+              r.raise_for_status()
+
+          print("MACD 4H taramasi basliyor...")
+
+          coins = top_200()
+          symbols = bybit_symbols()
+
+          print("Top 200:", len(coins))
+          print("Bybit perpetual:", len(symbols))
+
+          signals = []
+
+          for coin in coins:
+              symbol = coin + "USDT"
+
+              if symbol not in symbols:
+                  continue
+
+              try:
+                  rows = candles(symbol)
+
+                  if rows is None:
+                      continue
+
+                  signal, histogram = macd(rows)
+
+                  print(
+                      symbol,
+                      "Histogram:",
+                      round(histogram, 8),
+                      "Sinyal:",
+                      signal
                   )
 
-          except Exception as e:
-              print(f"{symbol} HATA: {e}")
+                  if signal:
+                      price = float(rows[-1][4])
+                      signals.append(
+                          (
+                              symbol,
+                              signal,
+                              price,
+                              histogram
+                          )
+                      )
 
-      if not signals:
-          print("Bu taramada yeni MACD sinyali yok.")
-          print("Tarama basariyla tamamlandi.")
-          raise SystemExit(0)
+              except Exception as e:
+                  print(symbol, "HATA:", e)
 
-      for item in signals:
-          emoji = "🟢" if item["signal"] == "AL" else "🔴"
+          for symbol, signal, price, histogram in signals:
 
-          message = (
-              f"🚨 MACD 4H ALARM 🚨\n\n"
-              f"Coin: {item['symbol']}\n"
-              f"Timeframe: 4H\n"
-              f"Sinyal: {item['signal']} {emoji}\n"
-              f"Fiyat: {item['price']}\n"
-              f"MACD histogram: {item['histogram']:.8f}\n\n"
-              f"Bybit Linear Futures"
+              emoji = "🟢" if signal == "AL" else "🔴"
+
+              message = (
+                  "🚨 MACD 4H ALARM 🚨\n\n"
+                  f"Coin: {symbol}\n"
+                  "Timeframe: 4H\n"
+                  f"Sinyal: {signal} {emoji}\n"
+                  f"Fiyat: {price}\n"
+                  f"MACD Histogram: {histogram:.8f}\n\n"
+                  "Bybit Linear Futures"
+              )
+
+              telegram(message)
+
+              print(
+                  "TELEGRAM GONDERILDI:",
+                  symbol,
+                  signal
+              )
+
+          print(
+              "Tarama tamamlandi. Yeni sinyal:",
+              len(signals)
           )
-
-          print(message)
-          send_telegram(message)
-
-      print(f"Toplam yeni sinyal: {len(signals)}")
-      print("Tarama basariyla tamamlandi.")
-      PY
+          PY
