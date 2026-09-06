@@ -22,14 +22,15 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
         run: |
           pip install requests pandas
 
           python - <<'PY'
           import os
+          import time
           import requests
           import pandas as pd
-          import time
 
           BYBIT = "https://api.bybit.com"
           CMC = "https://pro-api.coinmarketcap.com/public-api"
@@ -43,6 +44,7 @@ jobs:
               "Accept": "application/json"
           })
 
+
           # ============================================================
           # TELEGRAM
           # ============================================================
@@ -50,7 +52,7 @@ jobs:
           def send_telegram(message):
               url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
 
-              r = session.post(
+              response = session.post(
                   url,
                   data={
                       "chat_id": CHAT_ID,
@@ -59,14 +61,15 @@ jobs:
                   timeout=20
               )
 
-              r.raise_for_status()
+              response.raise_for_status()
+
 
           # ============================================================
-          # CMC TOP 200 MARKET CAP
+          # COINMARKETCAP TOP 200 - MARKET CAP
           # ============================================================
 
           def get_cmc_top_200():
-              url = f"{CMC}/v1/cryptocurrency/listings/latest"
+              url = f"{CMC}/v3/cryptocurrency/listings/latest"
 
               params = {
                   "start": 1,
@@ -75,25 +78,33 @@ jobs:
                   "sort": "market_cap"
               }
 
-              r = session.get(
+              response = session.get(
                   url,
                   params=params,
                   timeout=30
               )
 
-              r.raise_for_status()
+              response.raise_for_status()
 
-              data = r.json()
+              data = response.json()
 
               if "data" not in data:
                   raise RuntimeError(
                       f"CMC cevap hatası: {data}"
                   )
 
-              return data["data"]
+              coins = data["data"]
+
+              if len(coins) == 0:
+                  raise RuntimeError(
+                      "CMC Top 200 listesi boş geldi."
+                  )
+
+              return coins
+
 
           # ============================================================
-          # BYBIT LINEAR CONTRACTS
+          # BYBIT LINEAR PERPETUAL CONTRACTS
           # ============================================================
 
           def get_bybit_symbols():
@@ -103,7 +114,6 @@ jobs:
               symbols = {}
 
               while True:
-
                   params = {
                       "category": "linear",
                       "limit": 1000
@@ -112,41 +122,36 @@ jobs:
                   if cursor:
                       params["cursor"] = cursor
 
-                  r = session.get(
+                  response = session.get(
                       url,
                       params=params,
                       timeout=30
                   )
 
-                  r.raise_for_status()
+                  response.raise_for_status()
 
-                  data = r.json()
+                  data = response.json()
 
                   if data.get("retCode") != 0:
                       raise RuntimeError(
                           f"Bybit instruments hatası: {data}"
                       )
 
-                  result = data["result"]
+                  result = data.get("result", {})
 
                   for item in result.get("list", []):
-
                       symbol = item.get("symbol", "")
                       status = item.get("status", "")
                       contract_type = item.get("contractType", "")
+                      base_coin = item.get("baseCoin", "").upper()
 
                       if (
                           symbol.endswith("USDT")
                           and status == "Trading"
                           and contract_type == "LinearPerpetual"
+                          and base_coin
                       ):
-                          base_coin = item.get(
-                              "baseCoin",
-                              ""
-                          ).upper()
-
-                          if base_coin:
-                              symbols[base_coin] = symbol
+                          symbols[base_coin] = symbol
 
                   cursor = result.get("nextPageCursor")
 
@@ -155,12 +160,12 @@ jobs:
 
               return symbols
 
+
           # ============================================================
-          # BYBIT 4H KLINES
+          # BYBIT 4H KLINE
           # ============================================================
 
           def get_klines(symbol):
-
               url = f"{BYBIT}/v5/market/kline"
 
               params = {
@@ -170,34 +175,35 @@ jobs:
                   "limit": 100
               }
 
-              r = session.get(
+              response = session.get(
                   url,
                   params=params,
                   timeout=20
               )
 
-              r.raise_for_status()
+              response.raise_for_status()
 
-              data = r.json()
+              data = response.json()
 
               if data.get("retCode") != 0:
                   raise RuntimeError(
                       f"Kline hatası: {data}"
                   )
 
-              rows = data["result"]["list"]
+              rows = data.get("result", {}).get("list", [])
 
               if len(rows) < 40:
                   return None
 
-              # Bybit en yeni mumu ilk sırada verir.
+              # Bybit en yeni mumu ilk sırada döndürür.
+              # Zamana göre eskiden yeniye sırala.
               rows = sorted(
                   rows,
                   key=lambda x: int(x[0])
               )
 
-              # Son mum açık olabilir.
-              # Açık 4H mumu kesinlikle kullanma.
+              # Son mum açık 4H mumu olabilir.
+              # Açık mumu kullanma.
               rows = rows[:-1]
 
               closes = [
@@ -207,16 +213,17 @@ jobs:
 
               return closes
 
+
           # ============================================================
           # MACD 12 / 26 / 9
           # ============================================================
 
           def check_macd(closes):
 
-              if len(closes) < 35:
+              if closes is None or len(closes) < 35:
                   return None
 
-              close = pd.Series(closes)
+              close = pd.Series(closes, dtype="float64")
 
               ema12 = close.ewm(
                   span=12,
@@ -244,29 +251,57 @@ jobs:
 
               price = float(close.iloc[-1])
 
-              # MACD signal çizgisini aşağıdan yukarı kesiyor
+              # ========================================================
+              # AL
+              # MACD aşağıdan yukarı Signal çizgisini kesiyor
+              # ========================================================
+
               if (
                   prev_macd <= prev_signal
                   and curr_macd > curr_signal
               ):
                   return "AL", price
 
-              # MACD signal çizgisini yukarıdan aşağı kesiyor
+
+              # ========================================================
+              # SAT
+              # MACD yukarıdan aşağı Signal çizgisini kesiyor
+              # ========================================================
+
               if (
                   prev_macd >= prev_signal
                   and curr_macd < curr_signal
               ):
                   return "SAT", price
 
+
               return None
+
 
           # ============================================================
           # ANA TARAMA
           # ============================================================
+
+          print("========================================")
+          print("MACD ALARM BAŞLADI")
+          print("========================================")
 
           print("CMC Top 200 market-cap listesi alınıyor...")
 
           cmc_coins = get_cmc_top_200()
 
           print(
-              f"CMC'den {len(cmc_co
+              f"CMC'den {len(cmc_coins)} coin alındı."
+          )
+
+          print("Bybit USDT Linear Perpetual kontratları alınıyor...")
+
+          bybit_symbols = get_bybit_symbols()
+
+          print(
+              f"Bybit'te {len(bybit_symbols)} adet uygun kontrat bulundu."
+          )
+
+
+          # ============================================================
+          # TOP 200 MARKET CAP + BYBIT EŞLEŞT
