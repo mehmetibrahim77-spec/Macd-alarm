@@ -1,1 +1,39 @@
+name: Telegram Test
 
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Send Telegram Test
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python - <<'PY'
+          import os
+          import requests
+
+          token = os.environ["TELEGRAM_BOT_TOKEN"]
+          chat_id = os.environ["TELEGRAM_CHAT_ID"]
+
+          response = requests.post(
+              f"https://api.telegram.org/bot{token}/sendMessage",
+              data={
+                  "chat_id": chat_id,
+                  "text": "🚨 TEST MESAJI 🚨\n\nGitHub Actions → Telegram bağlantısı çalışıyor ✅"
+              },
+              timeout=20
+          )
+
+          print("HTTP:", response.status_code)
+          print("Telegram:", response.text)
+
+          response.raise_for_status()
+
+          if not response.json().get("ok"):
+              raise Exception("Telegram mesajı gönderilemedi.")
+          PY
