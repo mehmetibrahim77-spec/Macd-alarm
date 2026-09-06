@@ -3,7 +3,7 @@ name: MACD Alarm
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "5 */4 * * *"
 
 permissions:
   contents: read
@@ -34,9 +34,10 @@ jobs:
           import time
           import requests
           import pandas as pd
+          from datetime import datetime, timezone
 
-          CMC = "https://pro-api.coinmarketcap.com/public-api"
           BINANCE = "https://fapi.binance.com"
+          COINGECKO = "https://api.coingecko.com/api/v3"
 
           TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
           CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
@@ -48,11 +49,11 @@ jobs:
               raise RuntimeError("TELEGRAM_CHAT_ID secret bulunamadı.")
 
           session = requests.Session()
+
           session.headers.update({
-              "User-Agent": "MACD-Alarm/1.0",
+              "User-Agent": "MACD-Alarm/2.0",
               "Accept": "application/json"
           })
-
 
           # ============================================================
           # TELEGRAM
@@ -70,35 +71,31 @@ jobs:
                   timeout=20
               )
 
-              if not r.ok:
-                  raise RuntimeError(
-                      f"Telegram HTTP {r.status_code}: {r.text[:500]}"
-                  )
+              print("Telegram HTTP:", r.status_code)
+              print("Telegram cevap:", r.text[:500])
+
+              r.raise_for_status()
 
               data = r.json()
 
               if not data.get("ok"):
-                  raise RuntimeError(
-                      f"Telegram API hatası: {data}"
-                  )
-
+                  raise RuntimeError(f"Telegram API hatası: {data}")
 
           # ============================================================
-          # COINMARKETCAP - MARKET CAP TOP 200
+          # COINGECKO TOP 200
           # ============================================================
 
-          def get_cmc_top_200():
+          def get_top_200():
 
-              url = f"{CMC}/v3/cryptocurrency/listings/latest"
+              url = f"{COINGECKO}/coins/markets"
 
               params = {
-                  "start": 1,
-                  "limit": 200,
-                  "convert": "USD",
-                  "sort": "market_cap"
+                  "vs_currency": "usd",
+                  "order": "market_cap_desc",
+                  "per_page": 200,
+                  "page": 1,
+                  "sparkline": "false"
               }
-
-              print("CMC Top 200 market-cap isteniyor...")
 
               r = session.get(
                   url,
@@ -106,36 +103,21 @@ jobs:
                   timeout=30
               )
 
-              print(f"CMC HTTP: {r.status_code}")
+              print("CoinGecko HTTP:", r.status_code)
 
-              if not r.ok:
-                  raise RuntimeError(
-                      f"CMC HTTP {r.status_code}: {r.text[:1000]}"
-                  )
+              r.raise_for_status()
 
               data = r.json()
 
-              if "data" not in data:
-                  raise RuntimeError(
-                      f"CMC cevapta data yok: {data}"
-                  )
+              if not isinstance(data, list):
+                  raise RuntimeError("CoinGecko beklenmeyen cevap verdi.")
 
-              coins = data["data"]
+              print("Top 200 coin alındı:", len(data))
 
-              if not coins:
-                  raise RuntimeError(
-                      "CMC Top 200 boş geldi."
-                  )
-
-              print(
-                  f"CMC Top 200 başarıyla alındı: {len(coins)} coin"
-              )
-
-              return coins
-
+              return data
 
           # ============================================================
-          # BINANCE USDⓈ-M FUTURES
+          # BINANCE SYMBOLS
           # ============================================================
 
           def get_binance_symbols():
@@ -147,15 +129,9 @@ jobs:
                   timeout=30
               )
 
-              print(
-                  f"Binance exchangeInfo HTTP: {r.status_code}"
-              )
+              print("Binance exchangeInfo HTTP:", r.status_code)
 
-              if not r.ok:
-                  raise RuntimeError(
-                      f"Binance exchangeInfo HTTP "
-                      f"{r.status_code}: {r.text[:1000]}"
-                  )
+              r.raise_for_status()
 
               data = r.json()
 
@@ -177,16 +153,15 @@ jobs:
                   ):
                       symbols[base_asset.upper()] = symbol
 
-
               print(
-                  f"Binance USDT perpetual sayısı: {len(symbols)}"
+                  "Binance USDT perpetual sayısı:",
+                  len(symbols)
               )
 
               return symbols
 
-
           # ============================================================
-          # BINANCE 4H KLINE
+          # 4H KLINES
           # ============================================================
 
           def get_klines(symbol):
@@ -206,24 +181,229 @@ jobs:
               )
 
               if not r.ok:
-                  raise RuntimeError(
-                      f"{symbol} kline HTTP "
-                      f"{r.status_code}: {r.text[:500]}"
+                  print(
+                      f"{symbol}: HTTP {r.status_code}"
                   )
+                  return None
 
               rows = r.json()
 
               if not isinstance(rows, list):
-                  raise RuntimeError(
-                      f"{symbol} kline beklenmeyen cevap: {rows}"
-                  )
-
-              if len(rows) < 40:
-                  print(
-                      f"{symbol}: yeterli mum yok ({len(rows)})"
-                  )
                   return None
 
-              # Binance kronolojik olarak eski -> yeni döndürür.
-              # Son mum mevcut/açık mumdur.
-              # Sadece kapanmış mum
+              if len(rows) < 40:
+                  return None
+
+              # ========================================================
+              # SON MUM AÇIK OLABİLİR.
+              # Sadece kapanmış mumları kullanıyoruz.
+              # ========================================================
+
+              now_ms = int(time.time() * 1000)
+
+              closed_rows = [
+                  row for row in rows
+                  if int(row[6]) <= now_ms
+              ]
+
+              if len(closed_rows) < 40:
+                  return None
+
+              closes = [
+                  float(row[4])
+                  for row in closed_rows
+              ]
+
+              close_times = [
+                  int(row[6])
+                  for row in closed_rows
+              ]
+
+              return closes, close_times
+
+          # ============================================================
+          # MACD
+          # ============================================================
+
+          def calculate_macd(closes):
+
+              series = pd.Series(closes, dtype="float64")
+
+              ema12 = series.ewm(
+                  span=12,
+                  adjust=False
+              ).mean()
+
+              ema26 = series.ewm(
+                  span=26,
+                  adjust=False
+              ).mean()
+
+              macd = ema12 - ema26
+
+              signal = macd.ewm(
+                  span=9,
+                  adjust=False
+              ).mean()
+
+              histogram = macd - signal
+
+              return macd, signal, histogram
+
+          # ============================================================
+          # TOP 200 + BINANCE
+          # ============================================================
+
+          top_200 = get_top_200()
+
+          binance_symbols = get_binance_symbols()
+
+          results = []
+
+          checked = 0
+          skipped = 0
+
+          for rank, coin in enumerate(top_200, start=1):
+
+              base = coin.get("symbol", "").upper()
+
+              if not base:
+                  skipped += 1
+                  continue
+
+              symbol = binance_symbols.get(base)
+
+              if not symbol:
+                  skipped += 1
+                  continue
+
+              try:
+
+                  data = get_klines(symbol)
+
+                  if data is None:
+                      skipped += 1
+                      continue
+
+                  closes, close_times = data
+
+                  macd, signal, histogram = calculate_macd(
+                      closes
+                  )
+
+                  # ----------------------------------------------------
+                  # SON İKİ KAPANMIŞ MUM
+                  # ----------------------------------------------------
+
+                  previous_hist = float(histogram.iloc[-2])
+                  current_hist = float(histogram.iloc[-1])
+
+                  price = float(closes[-1])
+
+                  candle_close_ms = close_times[-1]
+
+                  candle_close = datetime.fromtimestamp(
+                      candle_close_ms / 1000,
+                      tz=timezone.utc
+                  )
+
+                  # ----------------------------------------------------
+                  # KIRMIZI -> YEŞİL = AL
+                  # ----------------------------------------------------
+
+                  if (
+                      previous_hist <= 0
+                      and current_hist > 0
+                  ):
+
+                      results.append({
+                          "rank": rank,
+                          "symbol": symbol,
+                          "signal": "AL",
+                          "price": price,
+                          "hist": current_hist,
+                          "candle_close": candle_close
+                      })
+
+                  # ----------------------------------------------------
+                  # YEŞİL -> KIRMIZI = SAT
+                  # ----------------------------------------------------
+
+                  elif (
+                      previous_hist >= 0
+                      and current_hist < 0
+                  ):
+
+                      results.append({
+                          "rank": rank,
+                          "symbol": symbol,
+                          "signal": "SAT",
+                          "price": price,
+                          "hist": current_hist,
+                          "candle_close": candle_close
+                      })
+
+                  checked += 1
+
+                  print(
+                      f"[{rank}/200] {symbol} "
+                      f"MACD histogram: "
+                      f"{previous_hist:.8f} -> "
+                      f"{current_hist:.8f}"
+                  )
+
+              except Exception as e:
+
+                  skipped += 1
+
+                  print(
+                      f"{symbol} hata: {e}"
+                  )
+
+              # Binance rate limitini gereksiz zorlamayalım.
+              time.sleep(0.05)
+
+          # ============================================================
+          # SONUÇ
+          # ============================================================
+
+          print("")
+          print("================================")
+          print("TARAMA TAMAMLANDI")
+          print("Kontrol edilen:", checked)
+          print("Atlanan:", skipped)
+          print("Sinyal:", len(results))
+          print("================================")
+
+          # ============================================================
+          # TELEGRAM
+          # ============================================================
+
+          if results:
+
+              for item in results:
+
+                  emoji = "🟢" if item["signal"] == "AL" else "🔴"
+
+                  message = (
+                      f"🚨 MACD 4H ALARM 🚨\n\n"
+                      f"Coin: {item['symbol']}\n"
+                      f"Timeframe: 4H\n"
+                      f"Sinyal: {item['signal']} {emoji}\n"
+                      f"Fiyat: {item['price']}\n"
+                      f"MACD Histogram: {item['hist']:.8f}\n"
+                      f"Top 200 Sırası: #{item['rank']}\n"
+                      f"Mum kapanışı: "
+                      f"{item['candle_close'].strftime('%Y-%m-%d %H:%M UTC')}"
+                  )
+
+                  send_telegram(message)
+
+          else:
+
+              print(
+                  "Yeni MACD AL/SAT sinyali yok."
+              )
+
+          print("İşlem tamamlandı.")
+          PY
