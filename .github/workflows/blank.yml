@@ -22,11 +22,13 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-
         run: |
+          set -e
+
+          python -m pip install --upgrade pip
           pip install requests pandas
 
-          python - <<'PY'
+          python <<'PY'
           import os
           import time
           import requests
@@ -35,8 +37,14 @@ jobs:
           BYBIT = "https://api.bybit.com"
           CMC = "https://pro-api.coinmarketcap.com/public-api"
 
-          TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-          CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+          TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+          CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+
+          if not TOKEN:
+              raise RuntimeError("TELEGRAM_BOT_TOKEN secret bulunamadı.")
+
+          if not CHAT_ID:
+              raise RuntimeError("TELEGRAM_CHAT_ID secret bulunamadı.")
 
           session = requests.Session()
           session.headers.update({
@@ -45,14 +53,14 @@ jobs:
           })
 
 
-          # ============================================================
+          # ------------------------------------------------------------
           # TELEGRAM
-          # ============================================================
+          # ------------------------------------------------------------
 
           def send_telegram(message):
               url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
 
-              response = session.post(
+              r = session.post(
                   url,
                   data={
                       "chat_id": CHAT_ID,
@@ -61,14 +69,25 @@ jobs:
                   timeout=20
               )
 
-              response.raise_for_status()
+              if not r.ok:
+                  raise RuntimeError(
+                      f"Telegram HTTP {r.status_code}: {r.text[:500]}"
+                  )
+
+              data = r.json()
+
+              if not data.get("ok"):
+                  raise RuntimeError(
+                      f"Telegram API hatası: {data}"
+                  )
 
 
-          # ============================================================
-          # COINMARKETCAP TOP 200 - MARKET CAP
-          # ============================================================
+          # ------------------------------------------------------------
+          # COINMARKETCAP - MARKET CAP TOP 200
+          # ------------------------------------------------------------
 
           def get_cmc_top_200():
+
               url = f"{CMC}/v3/cryptocurrency/listings/latest"
 
               params = {
@@ -78,42 +97,54 @@ jobs:
                   "sort": "market_cap"
               }
 
-              response = session.get(
+              print("CMC Top 200 market-cap isteniyor...")
+              print(f"CMC URL: {url}")
+
+              r = session.get(
                   url,
                   params=params,
                   timeout=30
               )
 
-              response.raise_for_status()
+              print(f"CMC HTTP status: {r.status_code}")
 
-              data = response.json()
+              if not r.ok:
+                  raise RuntimeError(
+                      f"CMC HTTP {r.status_code}: {r.text[:1000]}"
+                  )
+
+              data = r.json()
 
               if "data" not in data:
                   raise RuntimeError(
-                      f"CMC cevap hatası: {data}"
+                      f"CMC cevapta data yok: {data}"
                   )
 
               coins = data["data"]
 
-              if len(coins) == 0:
+              if not coins:
                   raise RuntimeError(
-                      "CMC Top 200 listesi boş geldi."
+                      "CMC Top 200 boş geldi."
                   )
+
+              print(f"CMC Top 200 başarıyla alındı: {len(coins)} coin")
 
               return coins
 
 
-          # ============================================================
-          # BYBIT LINEAR PERPETUAL CONTRACTS
-          # ============================================================
+          # ------------------------------------------------------------
+          # BYBIT LINEAR PERPETUAL
+          # ------------------------------------------------------------
 
           def get_bybit_symbols():
+
               url = f"{BYBIT}/v5/market/instruments-info"
 
               cursor = None
               symbols = {}
 
               while True:
+
                   params = {
                       "category": "linear",
                       "limit": 1000
@@ -122,24 +153,29 @@ jobs:
                   if cursor:
                       params["cursor"] = cursor
 
-                  response = session.get(
+                  r = session.get(
                       url,
                       params=params,
                       timeout=30
                   )
 
-                  response.raise_for_status()
+                  if not r.ok:
+                      raise RuntimeError(
+                          f"Bybit instruments HTTP {r.status_code}: "
+                          f"{r.text[:1000]}"
+                      )
 
-                  data = response.json()
+                  data = r.json()
 
                   if data.get("retCode") != 0:
                       raise RuntimeError(
-                          f"Bybit instruments hatası: {data}"
+                          f"Bybit instruments API hatası: {data}"
                       )
 
                   result = data.get("result", {})
 
                   for item in result.get("list", []):
+
                       symbol = item.get("symbol", "")
                       status = item.get("status", "")
                       contract_type = item.get("contractType", "")
@@ -158,14 +194,19 @@ jobs:
                   if not cursor:
                       break
 
+              print(
+                  f"Bybit USDT Linear Perpetual sayısı: {len(symbols)}"
+              )
+
               return symbols
 
 
-          # ============================================================
-          # BYBIT 4H KLINE
-          # ============================================================
+          # ------------------------------------------------------------
+          # BYBIT 4H KAPANMIŞ MUM
+          # ------------------------------------------------------------
 
           def get_klines(symbol):
+
               url = f"{BYBIT}/v5/market/kline"
 
               params = {
@@ -175,35 +216,40 @@ jobs:
                   "limit": 100
               }
 
-              response = session.get(
+              r = session.get(
                   url,
                   params=params,
                   timeout=20
               )
 
-              response.raise_for_status()
+              if not r.ok:
+                  raise RuntimeError(
+                      f"{symbol} kline HTTP {r.status_code}: "
+                      f"{r.text[:500]}"
+                  )
 
-              data = response.json()
+              data = r.json()
 
               if data.get("retCode") != 0:
                   raise RuntimeError(
-                      f"Kline hatası: {data}"
+                      f"{symbol} kline API hatası: {data}"
                   )
 
               rows = data.get("result", {}).get("list", [])
 
               if len(rows) < 40:
+                  print(
+                      f"{symbol}: yeterli mum yok ({len(rows)})"
+                  )
                   return None
 
-              # Bybit en yeni mumu ilk sırada döndürür.
-              # Zamana göre eskiden yeniye sırala.
               rows = sorted(
                   rows,
                   key=lambda x: int(x[0])
               )
 
-              # Son mum açık 4H mumu olabilir.
-              # Açık mumu kullanma.
+              # En son mum açık mumdur.
+              # Sadece kapanmış 4H mumları kullan.
               rows = rows[:-1]
 
               closes = [
@@ -214,16 +260,19 @@ jobs:
               return closes
 
 
-          # ============================================================
+          # ------------------------------------------------------------
           # MACD 12 / 26 / 9
-          # ============================================================
+          # ------------------------------------------------------------
 
           def check_macd(closes):
 
               if closes is None or len(closes) < 35:
                   return None
 
-              close = pd.Series(closes, dtype="float64")
+              close = pd.Series(
+                  closes,
+                  dtype="float64"
+              )
 
               ema12 = close.ewm(
                   span=12,
@@ -242,7 +291,6 @@ jobs:
                   adjust=False
               ).mean()
 
-              # Son iki KAPANMIŞ 4H mum
               prev_macd = float(macd.iloc[-2])
               prev_signal = float(signal.iloc[-2])
 
@@ -251,57 +299,188 @@ jobs:
 
               price = float(close.iloc[-1])
 
-              # ========================================================
-              # AL
-              # MACD aşağıdan yukarı Signal çizgisini kesiyor
-              # ========================================================
-
+              # AL:
+              # MACD Signal'ın altında/eşitken
+              # sonraki kapanmış mumda üstüne geçiyor.
               if (
                   prev_macd <= prev_signal
                   and curr_macd > curr_signal
               ):
                   return "AL", price
 
-
-              # ========================================================
-              # SAT
-              # MACD yukarıdan aşağı Signal çizgisini kesiyor
-              # ========================================================
-
+              # SAT:
+              # MACD Signal'ın üstünde/eşitken
+              # sonraki kapanmış mumda altına geçiyor.
               if (
                   prev_macd >= prev_signal
                   and curr_macd < curr_signal
               ):
                   return "SAT", price
 
-
               return None
 
 
-          # ============================================================
-          # ANA TARAMA
-          # ============================================================
+          # ------------------------------------------------------------
+          # ANA PROGRAM
+          # ------------------------------------------------------------
 
+          print("")
           print("========================================")
           print("MACD ALARM BAŞLADI")
           print("========================================")
 
-          print("CMC Top 200 market-cap listesi alınıyor...")
+          try:
 
-          cmc_coins = get_cmc_top_200()
+              cmc_coins = get_cmc_top_200()
 
-          print(
-              f"CMC'den {len(cmc_coins)} coin alındı."
-          )
+              bybit_symbols = get_bybit_symbols()
 
-          print("Bybit USDT Linear Perpetual kontratları alınıyor...")
+              matched_coins = []
 
-          bybit_symbols = get_bybit_symbols()
+              for coin in cmc_coins:
 
-          print(
-              f"Bybit'te {len(bybit_symbols)} adet uygun kontrat bulundu."
-          )
+                  symbol = str(
+                      coin.get("symbol", "")
+                  ).upper()
+
+                  rank = coin.get("cmc_rank")
+
+                  if symbol in bybit_symbols:
+
+                      matched_coins.append({
+                          "name": coin.get("name", symbol),
+                          "symbol": symbol,
+                          "rank": rank,
+                          "bybit_symbol": bybit_symbols[symbol]
+                      })
 
 
-          # ============================================================
-          # TOP 200 MARKET CAP + BYBIT EŞLEŞT
+              print(
+                  f"CMC Top 200: {len(cmc_coins)}"
+              )
+
+              print(
+                  f"Bybit eşleşmesi: {len(matched_coins)}"
+              )
+
+              print("")
+              print("4H MACD taraması başlıyor...")
+              print("")
+
+
+              signals_found = 0
+              errors = 0
+
+              for coin in matched_coins:
+
+                  name = coin["name"]
+                  symbol = coin["symbol"]
+                  rank = coin["rank"]
+                  bybit_symbol = coin["bybit_symbol"]
+
+                  try:
+
+                      print(
+                          f"Taranıyor #{rank}: "
+                          f"{symbol} -> {bybit_symbol}"
+                      )
+
+                      closes = get_klines(
+                          bybit_symbol
+                      )
+
+                      result = check_macd(
+                          closes
+                      )
+
+                      if result is None:
+                          continue
+
+                      signal, price = result
+
+                      signals_found += 1
+
+                      if signal == "AL":
+
+                          emoji = "🟢"
+
+                          description = (
+                              "MACD, Signal çizgisini "
+                              "aşağıdan yukarı kesti."
+                          )
+
+                      else:
+
+                          emoji = "🔴"
+
+                          description = (
+                              "MACD, Signal çizgisini "
+                              "yukarıdan aşağı kesti."
+                          )
+
+
+                      message = (
+                          f"🚨 MACD 4H ALARM 🚨\n\n"
+                          f"Coin: {symbol}USDT\n"
+                          f"CMC Rank: #{rank}\n"
+                          f"Timeframe: 4H\n"
+                          f"Sinyal: {signal} {emoji}\n"
+                          f"Fiyat: {price}\n\n"
+                          f"{description}"
+                      )
+
+                      print(
+                          f"!!! SİNYAL !!! "
+                          f"{symbol} {signal}"
+                      )
+
+                      send_telegram(
+                          message
+                      )
+
+                      time.sleep(0.2)
+
+
+                  except Exception as e:
+
+                      errors += 1
+
+                      print(
+                          f"HATA - {symbol} "
+                          f"({bybit_symbol}): {e}"
+                      )
+
+                      continue
+
+
+              print("")
+              print("========================================")
+              print("TARAMA TAMAMLANDI")
+              print("========================================")
+              print(
+                  f"CMC Top 200: {len(cmc_coins)}"
+              )
+              print(
+                  f"Bybit eşleşmesi: {len(matched_coins)}"
+              )
+              print(
+                  f"MACD sinyali: {signals_found}"
+              )
+              print(
+                  f"Coin hatası: {errors}"
+              )
+              print("========================================")
+
+
+          except Exception as e:
+
+              print("")
+              print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+              print("ANA PROGRAM HATASI")
+              print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+              print(str(e))
+              print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+
+              raise
+
+          PY
